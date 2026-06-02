@@ -82,7 +82,7 @@ fn hash_gen(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let cell = vec3<i32>(floor(p.pos.xyz / cell_size));
     
     // Función de dispersión espacial robusta
-    let h = (u32(cell.x) * 73856093u ^ u32(cell.y) * 19349663u ^ u32(cell.z) * 83492791u) % grid_size;
+    let h = ((u32(cell.x) * 73856093u) ^ (u32(cell.y) * 19349663u) ^ (u32(cell.z) * 83492791u)) % grid_size;
     
     keys[idx] = ParticleKey(h, idx);
 }
@@ -166,7 +166,7 @@ fn sph_density(@builtin(global_invocation_id) global_id: vec3<u32>) {
         for (var y = -1; y <= 1; y = y + 1) {
             for (var x = -1; x <= 1; x = x + 1) {
                 let cell = center_cell + vec3<i32>(x, y, z);
-                let h_cell = (u32(cell.x) * 73856093u ^ u32(cell.y) * 19349663u ^ u32(cell.z) * 83492791u) % grid_size;
+                let h_cell = ((u32(cell.x) * 73856093u) ^ (u32(cell.y) * 19349663u) ^ (u32(cell.z) * 83492791u)) % grid_size;
                 
                 let start = cell_starts[h_cell];
                 let end = cell_ends[h_cell];
@@ -222,7 +222,7 @@ fn sph_force(@builtin(global_invocation_id) global_id: vec3<u32>) {
         for (var y = -1; y <= 1; y = y + 1) {
             for (var x = -1; x <= 1; x = x + 1) {
                 let cell = center_cell + vec3<i32>(x, y, z);
-                let h_cell = (u32(cell.x) * 73856093u ^ u32(cell.y) * 19349663u ^ u32(cell.z) * 83492791u) % grid_size;
+                let h_cell = ((u32(cell.x) * 73856093u) ^ (u32(cell.y) * 19349663u) ^ (u32(cell.z) * 83492791u)) % grid_size;
                 
                 let start = cell_starts[h_cell];
                 let end = cell_ends[h_cell];
