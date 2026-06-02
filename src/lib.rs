@@ -1854,14 +1854,17 @@ pub async fn start() -> Result<(), JsValue> {
                     let qb = query_buffer.as_ref().unwrap();
                     let qrb = query_readback_buffer.as_ref().unwrap().clone();
 
-                    map_and_read_timestamps(qrb.clone(), query_pending_clone, timestamp_period);
-
+                    // 1. Resolver y copiar timestamps a la CPU ANTES de mapear:
+                    //    el buffer debe estar idle cuando map_async se ejecute.
                     let mut resolve_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("Resolve Query Encoder"),
                     });
                     resolve_encoder.resolve_query_set(qs, 0..6, qb, 0);
                     resolve_encoder.copy_buffer_to_buffer(qb, 0, &qrb, 0, 48);
                     queue.submit(std::iter::once(resolve_encoder.finish()));
+
+                    // 2. Ahora sí mapeamos: la GPU ya terminó de escribir en qrb.
+                    map_and_read_timestamps(qrb, query_pending_clone, timestamp_period);
                 }
             }
         }
