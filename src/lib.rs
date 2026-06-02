@@ -177,7 +177,7 @@ pub async fn start() -> Result<(), JsValue> {
             &wgpu::DeviceDescriptor {
                 label: Some("Wgpu Device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
+                required_limits: wgpu::Limits::default(),
             },
             None,
         )
