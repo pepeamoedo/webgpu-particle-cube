@@ -127,6 +127,18 @@
     <canvas id="canvas"></canvas>
 
     <script type="module">
+        // Monkey-patch GPUAdapter.prototype.requestDevice para evitar la caída por el límite obsoleto en Chrome 135+
+        if (typeof GPUAdapter !== "undefined" && GPUAdapter.prototype.requestDevice) {
+            const originalRequestDevice = GPUAdapter.prototype.requestDevice;
+            GPUAdapter.prototype.requestDevice = function (descriptor) {
+                if (descriptor && descriptor.requiredLimits) {
+                    delete descriptor.requiredLimits.maxInterStageShaderComponents;
+                }
+                return originalRequestDevice.call(this, descriptor);
+            };
+            console.log("WebGPU monkey-patch para 'maxInterStageShaderComponents' aplicado con éxito.");
+        }
+
         import init from "./pkg/webgpu_wasm_triangle.js";
         
         async function run() {
