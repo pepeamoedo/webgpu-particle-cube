@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -55,7 +57,36 @@ struct ComputeParams {
     spacing: f32,
     delta_time: f32,
     intensity: f32,
-    dummy: f32,
+    mouse_active: f32,
+    mouse_pos: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[allow(dead_code)]
+struct ParticleKey {
+    hash: u32,
+    index: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[allow(dead_code)]
+struct GridParams {
+    cell_size: f32,
+    grid_size: u32,
+    num_particles: u32,
+    dummy: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[allow(dead_code)]
+struct SortParams {
+    stage: u32,
+    step: u32,
+    pad0: u32,
+    pad1: u32,
 }
 
 // =====================================================================
@@ -66,9 +97,15 @@ struct CameraState {
     theta: f32,
     phi: f32,
     radius: f32,
+    target_theta: f32,
+    target_phi: f32,
+    target_radius: f32,
     is_dragging: bool,
     last_mouse_x: f32,
     last_mouse_y: f32,
+    mouse_ndc_x: f32,
+    mouse_ndc_y: f32,
+    mouse_active: bool,
 }
 
 struct ViewportState {
@@ -95,7 +132,11 @@ fn create_depth_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfigurati
     depth_texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn create_multisampled_framebuffer(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+fn create_multisampled_framebuffer(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    format: wgpu::TextureFormat,
+) -> wgpu::TextureView {
     let multisampled_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("MSAA Framebuffer"),
         size: wgpu::Extent3d {
@@ -106,11 +147,49 @@ fn create_multisampled_framebuffer(device: &wgpu::Device, config: &wgpu::Surface
         mip_level_count: 1,
         sample_count: 4, // MSAA 4x
         dimension: wgpu::TextureDimension::D2,
-        format: config.format,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     multisampled_texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn create_hdr_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("HDR Color Texture"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn create_bloom_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration, label: &str) -> wgpu::TextureView {
+    let width = (config.width / 4).max(1);
+    let height = (config.height / 4).max(1);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -173,17 +252,29 @@ pub async fn start() -> Result<(), JsValue> {
         .await
         .ok_or("No se encontró un adaptador compatible")?;
 
+    let supports_timestamp = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+    let mut required_features = wgpu::Features::empty();
+    if supports_timestamp {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY;
+    }
+
     let (device, queue) = adapter
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("Wgpu Device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
             },
             None,
         )
         .await
         .map_err(|e| JsValue::from_str(&format!("Error al solicitar dispositivo: {:?}", e)))?;
+
+    let timestamp_period = if supports_timestamp {
+        queue.get_timestamp_period() as f64
+    } else {
+        1.0
+    };
 
     // Configurar Superficie
     let surface_caps = surface.get_capabilities(&adapter);
@@ -206,14 +297,20 @@ pub async fn start() -> Result<(), JsValue> {
     };
     surface.configure(&device, &config);
 
-    // Bindeo de Eventos Interactivos de la Cámara (Ángulos esféricos)
+    // Bindeo de Eventos Interactivos de la Cámara (Ángulos esféricos e Interacción 3D)
     let camera_state = Rc::new(RefCell::new(CameraState {
         theta: 0.8,
         phi: 1.2,
         radius: 4.5,
+        target_theta: 0.8,
+        target_phi: 1.2,
+        target_radius: 4.5,
         is_dragging: false,
         last_mouse_x: 0.0,
         last_mouse_y: 0.0,
+        mouse_ndc_x: 0.0,
+        mouse_ndc_y: 0.0,
+        mouse_active: false,
     }));
 
     {
@@ -240,16 +337,28 @@ pub async fn start() -> Result<(), JsValue> {
 
     {
         let cam = camera_state.clone();
+        let canvas_for_move = canvas.clone();
         let on_mousemove = Closure::wrap(Box::new(move |e: web_sys::MouseEvent| {
+            let el: &web_sys::Element = canvas_for_move.as_ref();
+            let rect = el.get_bounding_client_rect();
+            let client_x = e.client_x() as f64 - rect.left();
+            let client_y = e.client_y() as f64 - rect.top();
+            let ndc_x = (client_x / rect.width()) * 2.0 - 1.0;
+            let ndc_y = 1.0 - (client_y / rect.height()) * 2.0;
+
             let mut c = cam.borrow_mut();
+            c.mouse_ndc_x = ndc_x as f32;
+            c.mouse_ndc_y = ndc_y as f32;
+            c.mouse_active = true;
+
             if c.is_dragging {
                 let x = e.client_x() as f32;
                 let y = e.client_y() as f32;
                 let dx = x - c.last_mouse_x;
                 let dy = y - c.last_mouse_y;
 
-                c.theta += dx * 0.005;
-                c.phi = (c.phi - dy * 0.005).clamp(0.1, std::f32::consts::PI - 0.1);
+                c.target_theta += dx * 0.005;
+                c.target_phi = (c.target_phi - dy * 0.005).clamp(0.1, std::f32::consts::PI - 0.1);
 
                 c.last_mouse_x = x;
                 c.last_mouse_y = y;
@@ -261,37 +370,65 @@ pub async fn start() -> Result<(), JsValue> {
 
     {
         let cam = camera_state.clone();
+        let on_mouseleave = Closure::wrap(Box::new(move |_: web_sys::MouseEvent| {
+            let mut c = cam.borrow_mut();
+            c.mouse_active = false;
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("mouseleave", on_mouseleave.as_ref().unchecked_ref())?;
+        on_mouseleave.forget();
+    }
+
+    {
+        let cam = camera_state.clone();
         let on_wheel = Closure::wrap(Box::new(move |e: web_sys::WheelEvent| {
             let mut c = cam.borrow_mut();
-            c.radius = (c.radius + e.delta_y() as f32 * 0.004).clamp(1.5, 12.0);
+            c.target_radius = (c.target_radius + e.delta_y() as f32 * 0.004).clamp(1.5, 12.0);
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("wheel", on_wheel.as_ref().unchecked_ref())?;
         on_wheel.forget();
     }
 
     // =====================================================================
-    // INICIALIZACIÓN DE DATOS DEL STORAGE BUFFER (1,728 PARTÍCULAS)
+    // INICIALIZACIÓN DE DATOS DEL STORAGE BUFFER (65,536 PARTÍCULAS SPH)
     // =====================================================================
-    let num_particles = 1728;
+    fn lcg_random(state: &mut u32) -> f32 {
+        *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        (*state as f32) / (u32::MAX as f32)
+    }
+
+    let num_particles = 8192;
+    let grid_size = 8192;
     let mut initial_particles = Vec::with_capacity(num_particles);
-    let spacing_init = 1.0f32;
+    let mut seed = 123456789u32;
     
-    for iz in 0..12 {
-        for iy in 0..12 {
-            for ix in 0..12 {
-                // Generar coordenadas del cubo de cristal de -1.0 a 1.0 (centrado en el origen)
-                let px = (ix as f32 - 5.5) * (spacing_init / 5.5);
-                let py = (iy as f32 - 5.5) * (spacing_init / 5.5);
-                let pz = (iz as f32 - 5.5) * (spacing_init / 5.5);
+    // Inicialización en cuadrícula 3D alineada con pequeño jitter para estabilidad SPH
+    // 8192 = 16 × 16 × 32 → distribuimos en un cubo de [-0.8, 0.8]^3
+    let gx: usize = 16;
+    let gy: usize = 16;
+    let gz: usize = 32;
+    let extent = 0.82f32; // radio del bloque inicial dentro de la urna
+    let jitter = 0.008f32; // pequeño desorden para iniciar el SPH sin singularidades
+    
+    'outer: for iz in 0..gz {
+        for iy in 0..gy {
+            for ix in 0..gx {
+                if initial_particles.len() >= num_particles { break 'outer; }
                 
-                // Velocidades orbitales iniciales en el eje Y (tangente)
-                let vx = -pz * 0.1;
-                let vy = 0.0f32;
-                let vz = px * 0.1;
+                let px_base = -extent + (ix as f32 + 0.5) * (2.0 * extent / gx as f32);
+                let py_base = -extent + (iy as f32 + 0.5) * (2.0 * extent / gy as f32);
+                let pz_base = -extent + (iz as f32 + 0.5) * (2.0 * extent / gz as f32);
+                
+                let jx = (lcg_random(&mut seed) - 0.5) * jitter;
+                let jy = (lcg_random(&mut seed) - 0.5) * jitter;
+                let jz = (lcg_random(&mut seed) - 0.5) * jitter;
+                
+                let px = px_base + jx;
+                let py = py_base + jy;
+                let pz = pz_base + jz;
                 
                 initial_particles.push(ParticleStruct {
-                    pos: [px, py, pz, 1.0],
-                    vel: [vx, vy, vz, 0.0],
+                    pos: [px, py, pz, 1.0], // w: densidad
+                    vel: [0.0, 0.0, 0.0, 0.0], // reposo inicial — la gravedad y SPH lo ponen en movimiento
                 });
             }
         }
@@ -308,6 +445,80 @@ pub async fn start() -> Result<(), JsValue> {
         queue.write_buffer(&storage_buffer, 0, slice_as_u8_slice(&initial_particles));
     }
 
+    // =====================================================================
+    // CREACIÓN DE BUFFERS AUXILIARES PARA SPATIAL HASHING & SORT
+    // =====================================================================
+    
+    // Keys buffer for bitonic sort: u32 hash + u32 index = 8 bytes per particle
+    let keys_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Particle Keys Buffer"),
+        size: (num_particles * std::mem::size_of::<ParticleKey>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Cell starts buffer (grid_size * 4 bytes)
+    let cell_starts_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Cell Starts Buffer"),
+        size: (grid_size * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Cell ends buffer (grid_size * 4 bytes)
+    let cell_ends_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Cell Ends Buffer"),
+        size: (grid_size * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Uniform buffer for GridParams
+    let grid_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Grid Params Buffer"),
+        size: std::mem::size_of::<GridParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let initial_grid_params = GridParams {
+        cell_size: 0.18, // radius interaction H
+        grid_size: grid_size as u32,
+        num_particles: num_particles as u32,
+        dummy: 0,
+    };
+    unsafe {
+        queue.write_buffer(&grid_params_buffer, 0, any_as_u8_slice(&initial_grid_params));
+    }
+
+    // Uniform buffer for SortParams (with pre-allocated deterministic dynamic offset entries)
+    let mut sort_params_data = Vec::new();
+    let mut stage = 2u32;
+    let mut step_offsets = Vec::new();
+    while stage <= num_particles as u32 {
+        let mut step = stage / 2;
+        while step > 0 {
+            step_offsets.push(sort_params_data.len() as u32);
+            // Each entry is SortParams aligned to 256 bytes (which is 64 u32s / 256 bytes)
+            let mut entry = vec![0u32; 64];
+            entry[0] = stage;
+            entry[1] = step;
+            sort_params_data.extend_from_slice(&entry);
+            step /= 2;
+        }
+        stage *= 2;
+    }
+
+    let sort_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Sort Params Buffer"),
+        size: (sort_params_data.len() * 4) as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    unsafe {
+        queue.write_buffer(&sort_params_buffer, 0, slice_as_u8_slice(&sort_params_data));
+    }
+
     // Crear Uniform Buffer para parámetros de Cómputo
     let compute_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Compute Params Buffer"),
@@ -319,7 +530,8 @@ pub async fn start() -> Result<(), JsValue> {
         spacing: 1.0,
         delta_time: 0.016,
         intensity: 0.8,
-        dummy: 0.0,
+        mouse_active: 0.0,
+        mouse_pos: [0.0, 0.0, 0.0, 0.0],
     };
     unsafe {
         queue.write_buffer(&compute_params_buffer, 0, any_as_u8_slice(&initial_compute_params));
@@ -432,9 +644,13 @@ pub async fn start() -> Result<(), JsValue> {
     // =====================================================================
     // CREACIÓN DEL BIND GROUP LAYOUT Y BIND GROUP (COMPUTE)
     // =====================================================================
+    // =====================================================================
+    // CREACIÓN DEL BIND GROUP LAYOUT Y BIND GROUP (COMPUTE)
+    // =====================================================================
     let compute_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("Compute Bind Group Layout"),
         entries: &[
+            // 0: particles (storage read_write)
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -445,12 +661,68 @@ pub async fn start() -> Result<(), JsValue> {
                 },
                 count: None,
             },
+            // 1: keys (storage read_write)
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 2: cell_starts (storage read_write)
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 3: cell_ends (storage read_write)
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 4: params (uniform)
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 5: grid_params (uniform)
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 6: sort_params (uniform, has_dynamic_offset: true)
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
                     min_binding_size: None,
                 },
                 count: None,
@@ -468,7 +740,31 @@ pub async fn start() -> Result<(), JsValue> {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
+                resource: keys_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: cell_starts_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: cell_ends_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
                 resource: compute_params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: grid_params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &sort_params_buffer,
+                    offset: 0,
+                    size: Some(std::num::NonZeroU64::new(256).unwrap()),
+                }),
             },
         ],
     });
@@ -516,11 +812,39 @@ pub async fn start() -> Result<(), JsValue> {
     // =====================================================================
     // COMPILACIÓN DE PIPELINES (SINCRÓNICOS PARA COMPATIBILIDAD CON WGPU 0.19)
     // =====================================================================
-    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("Compute Pipeline"),
+    let hash_gen_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Hash Gen Pipeline"),
         layout: Some(&compute_pipeline_layout),
         module: &compute_shader,
-        entry_point: "main",
+        entry_point: "hash_gen",
+    });
+
+    let bitonic_sort_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Bitonic Sort Pipeline"),
+        layout: Some(&compute_pipeline_layout),
+        module: &compute_shader,
+        entry_point: "bitonic_sort",
+    });
+
+    let cell_offsets_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Cell Offsets Pipeline"),
+        layout: Some(&compute_pipeline_layout),
+        module: &compute_shader,
+        entry_point: "cell_offsets",
+    });
+
+    let sph_density_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("SPH Density Pipeline"),
+        layout: Some(&compute_pipeline_layout),
+        module: &compute_shader,
+        entry_point: "sph_density",
+    });
+
+    let sph_force_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("SPH Force Pipeline"),
+        layout: Some(&compute_pipeline_layout),
+        module: &compute_shader,
+        entry_point: "sph_force",
     });
 
     let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -535,7 +859,7 @@ pub async fn start() -> Result<(), JsValue> {
             module: &shader,
             entry_point: "fs_main",
             targets: &[Some(wgpu::ColorTargetState {
-                format: config.format,
+                format: wgpu::TextureFormat::Rgba16Float,
                 blend: Some(wgpu::BlendState {
                     color: wgpu::BlendComponent {
                         src_factor: wgpu::BlendFactor::SrcAlpha,
@@ -587,7 +911,7 @@ pub async fn start() -> Result<(), JsValue> {
             module: &shader,
             entry_point: "fs_line",
             targets: &[Some(wgpu::ColorTargetState {
-                format: config.format,
+                format: wgpu::TextureFormat::Rgba16Float,
                 blend: Some(wgpu::BlendState {
                     color: wgpu::BlendComponent {
                         src_factor: wgpu::BlendFactor::SrcAlpha,
@@ -639,7 +963,7 @@ pub async fn start() -> Result<(), JsValue> {
             module: &shader,
             entry_point: "fs_glass",
             targets: &[Some(wgpu::ColorTargetState {
-                format: config.format,
+                format: wgpu::TextureFormat::Rgba16Float,
                 blend: Some(wgpu::BlendState {
                     color: wgpu::BlendComponent {
                         src_factor: wgpu::BlendFactor::SrcAlpha,
@@ -679,6 +1003,243 @@ pub async fn start() -> Result<(), JsValue> {
         multiview: None,
     });
 
+    // =====================================================================
+    // CONFIGURACIÓN DE POST-PROCESAMIENTO: HDR BLOOM Y BLUR GAUSSIANO
+    // =====================================================================
+    let postprocess_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Postprocess Shader Module"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/postprocess.wgsl").into()),
+    });
+
+    let post_process_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Post Process Sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug)]
+    struct BlurParams {
+        texel_size: [f32; 2],
+        dummy: [f32; 2],
+    }
+
+    let blur_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Blur Params Buffer"),
+        size: std::mem::size_of::<BlurParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let texture_sampler_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Texture Sampler Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let blur_params_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Blur Params Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let composite_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Composite Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let bright_extract_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Bright Extract Pipeline Layout"),
+        bind_group_layouts: &[&texture_sampler_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Blur Pipeline Layout"),
+        bind_group_layouts: &[&texture_sampler_bind_group_layout, &blur_params_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let post_process_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Post Process Pipeline Layout"),
+        bind_group_layouts: &[&bind_group_layout, &composite_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let bright_extract_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Bright Extract Pipeline"),
+        layout: Some(&bright_extract_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &postprocess_shader,
+            entry_point: "vs_post_process",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &postprocess_shader,
+            entry_point: "fs_bright_extract",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    let blur_h_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Blur H Pipeline"),
+        layout: Some(&blur_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &postprocess_shader,
+            entry_point: "vs_post_process",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &postprocess_shader,
+            entry_point: "fs_blur_h",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    let blur_v_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Blur V Pipeline"),
+        layout: Some(&blur_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &postprocess_shader,
+            entry_point: "vs_post_process",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &postprocess_shader,
+            entry_point: "fs_blur_v",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    let post_process_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Post Process Pipeline"),
+        layout: Some(&post_process_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &postprocess_shader,
+            entry_point: "vs_post_process",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &postprocess_shader,
+            entry_point: "fs_composite",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    let blur_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Blur Params Bind Group"),
+        layout: &blur_params_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: blur_params_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    // Escribir parámetros de desenfoque iniciales
+    {
+        let low_res_w = (physical_width / 4).max(1) as f32;
+        let low_res_h = (physical_height / 4).max(1) as f32;
+        let blur_params = BlurParams {
+            texel_size: [1.0 / low_res_w, 1.0 / low_res_h],
+            dummy: [0.0, 0.0],
+        };
+        unsafe {
+            queue.write_buffer(&blur_params_buffer, 0, any_as_u8_slice(&blur_params));
+        }
+    }
+
     log::info!("Pipelines, Storage y Uniforms inicializados. Lanzando bucle interactivo.");
 
     // =====================================================================
@@ -711,9 +1272,83 @@ pub async fn start() -> Result<(), JsValue> {
         obs
     };
 
-    // Inicializar buffers multisampled framebuffer y depth texture
-    let mut msaa_texture_view = create_multisampled_framebuffer(&device, &config);
+    // Inicializar buffers multisampled framebuffer, depth texture y texturas de post-procesamiento
+    let mut msaa_texture_view = create_multisampled_framebuffer(&device, &config, wgpu::TextureFormat::Rgba16Float);
     let mut depth_texture_view = create_depth_texture(&device, &config);
+    let mut hdr_texture_view = create_hdr_texture(&device, &config);
+    let mut brights_texture_view = create_bloom_texture(&device, &config, "Brights Texture");
+    let mut blur_temp_texture_view = create_bloom_texture(&device, &config, "Blur Temp Texture");
+
+    // Inicializar QuerySet y buffers de perfilado si está soportado
+    let query_set = if supports_timestamp {
+        Some(device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("GPU Timing Query Set"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 6,
+        }))
+    } else {
+        None
+    };
+
+    let query_buffer = if supports_timestamp {
+        Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GPU Timing Query Buffer"),
+            size: 48, // 6 queries * 8 bytes
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }))
+    } else {
+        None
+    };
+
+    let query_readback_buffer = if supports_timestamp {
+        Some(Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GPU Timing Query Readback Buffer"),
+            size: 48,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })))
+    } else {
+        None
+    };
+
+    // Crear bind groups iniciales
+    let mut extract_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Extract Bind Group"),
+        layout: &texture_sampler_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler) },
+        ],
+    });
+
+    let mut blur_h_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Blur H Bind Group"),
+        layout: &texture_sampler_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&brights_texture_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler) },
+        ],
+    });
+
+    let mut blur_v_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Blur V Bind Group"),
+        layout: &texture_sampler_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&blur_temp_texture_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler) },
+        ],
+    });
+
+    let mut composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Composite Bind Group"),
+        layout: &composite_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&brights_texture_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&post_process_sampler) },
+        ],
+    });
 
     // Reloj de alta precisión para medir delta_time estable
     let performance = window.performance().ok_or("No existe performance object")?;
@@ -729,7 +1364,11 @@ pub async fn start() -> Result<(), JsValue> {
     let render_pipeline = Rc::new(render_pipeline);
     let line_pipeline = Rc::new(line_pipeline);
     let glass_pipeline = Rc::new(glass_pipeline);
-    let compute_pipeline = Rc::new(compute_pipeline);
+    let hash_gen_pipeline = Rc::new(hash_gen_pipeline);
+    let bitonic_sort_pipeline = Rc::new(bitonic_sort_pipeline);
+    let cell_offsets_pipeline = Rc::new(cell_offsets_pipeline);
+    let sph_density_pipeline = Rc::new(sph_density_pipeline);
+    let sph_force_pipeline = Rc::new(sph_force_pipeline);
     let bind_group = Rc::new(bind_group);
     let bind_group_1 = Rc::new(bind_group_1);
     let compute_bind_group = Rc::new(compute_bind_group);
@@ -747,11 +1386,26 @@ pub async fn start() -> Result<(), JsValue> {
     let lighting_buffer_clone = lighting_buffer.clone();
     let line_pipeline_clone = line_pipeline.clone();
     let glass_pipeline_clone = glass_pipeline.clone();
+
+    // Clones de recursos de post-procesamiento para el bucle de renderizado
+    let bright_extract_pipeline_clone = Rc::new(bright_extract_pipeline);
+    let blur_h_pipeline_clone = Rc::new(blur_h_pipeline);
+    let blur_v_pipeline_clone = Rc::new(blur_v_pipeline);
+    let post_process_pipeline_clone = Rc::new(post_process_pipeline);
+    let blur_params_bind_group_clone = Rc::new(blur_params_bind_group);
+    
+    let texture_sampler_bind_group_layout_clone = Rc::new(texture_sampler_bind_group_layout);
+    let composite_bind_group_layout_clone = Rc::new(composite_bind_group_layout);
+    let post_process_sampler_clone = Rc::new(post_process_sampler);
+    let blur_params_buffer_clone = Rc::new(blur_params_buffer);
+
     let _observer_keep_alive = observer; // Mantener vivo el ResizeObserver moviéndolo al contexto
 
     let mut last_size_val = -1.0f32;
     let mut last_spacing_val = -1.0f32;
     let mut last_light_val = -1.0f32;
+
+    let query_pending = Arc::new(AtomicBool::new(false));
 
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
         // A. Resize dinámico libre de Layout Thrashing (ResizeObserver)
@@ -784,8 +1438,60 @@ pub async fn start() -> Result<(), JsValue> {
                 surface.configure(&device, &config);
                 
                 // Recrear texturas MSAA y profundidad para coincidir con la resolución física exacta
-                msaa_texture_view = create_multisampled_framebuffer(&device, &config);
+                msaa_texture_view = create_multisampled_framebuffer(&device, &config, wgpu::TextureFormat::Rgba16Float);
                 depth_texture_view = create_depth_texture(&device, &config);
+                hdr_texture_view = create_hdr_texture(&device, &config);
+                brights_texture_view = create_bloom_texture(&device, &config, "Brights Texture");
+                blur_temp_texture_view = create_bloom_texture(&device, &config, "Blur Temp Texture");
+
+                // Escribir los nuevos parámetros de desenfoque
+                let low_res_w = (physical_width / 4).max(1) as f32;
+                let low_res_h = (physical_height / 4).max(1) as f32;
+                let blur_params = BlurParams {
+                    texel_size: [1.0 / low_res_w, 1.0 / low_res_h],
+                    dummy: [0.0, 0.0],
+                };
+                unsafe {
+                    queue.write_buffer(&blur_params_buffer_clone, 0, any_as_u8_slice(&blur_params));
+                }
+
+                // Recrear bind groups con las nuevas vistas de texturas
+                extract_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Extract Bind Group"),
+                    layout: &texture_sampler_bind_group_layout_clone,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler_clone) },
+                    ],
+                });
+
+                blur_h_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Blur H Bind Group"),
+                    layout: &texture_sampler_bind_group_layout_clone,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&brights_texture_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler_clone) },
+                    ],
+                });
+
+                blur_v_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Blur V Bind Group"),
+                    layout: &texture_sampler_bind_group_layout_clone,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&blur_temp_texture_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler_clone) },
+                    ],
+                });
+
+                composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Composite Bind Group"),
+                    layout: &composite_bind_group_layout_clone,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&brights_texture_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&post_process_sampler_clone) },
+                    ],
+                });
             }
         }
 
@@ -826,20 +1532,15 @@ pub async fn start() -> Result<(), JsValue> {
             dt = 0.016; // Prevenir saltos de físicas al suspender pestaña
         }
 
-        // Escribir los parámetros de cómputo (físicas dinámicas en GPU)
-        let compute_params_data = ComputeParams {
-            spacing: spacing_val,
-            delta_time: dt,
-            intensity: light_val,
-            dummy: 0.0,
-        };
-        unsafe {
-            queue.write_buffer(&compute_params_buffer, 0, any_as_u8_slice(&compute_params_data));
-        }
-
-        // B. CALCULAR PROCESO DE CÁMARA E INTERACCIÓN (SIMD Glam Math)
-        let (eye, view_proj) = {
-            let state = camera_state.borrow();
+        // B. CALCULAR PROCESO DE CÁMARA E INTERACCIÓN (SIMD Glam Math con Inercia)
+        let (eye, view_proj, mouse_active_val, mouse_pos_val) = {
+            let mut state = camera_state.borrow_mut();
+            
+            // Interpolación exponencial amortiguada independiente de la tasa de refresco
+            let factor = 1.0 - (-12.0 * dt).exp();
+            state.theta += (state.target_theta - state.theta) * factor;
+            state.phi += (state.target_phi - state.phi) * factor;
+            state.radius += (state.target_radius - state.radius) * factor;
             
             // Convertir ángulos esféricos a posición 3D
             let eye_x = state.radius * state.phi.sin() * state.theta.cos();
@@ -860,9 +1561,52 @@ pub async fn start() -> Result<(), JsValue> {
             let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect, 0.1, 100.0);
             
             let vp = proj * view;
+
+            // Proyección del Cursor 3D (Ray casting asíncrono e Intersección con Plano)
+            let mut mouse_active_val = 0.0f32;
+            let mut mouse_pos_val = [0.0f32; 4];
             
-            (eye_pos, vp.to_cols_array())
+            if state.mouse_active {
+                // Si el usuario arrastra (clic sostenido), modo 2.0 (vórtice atractor), de lo contrario modo 1.0 (soplido repulsivo)
+                mouse_active_val = if state.is_dragging { 2.0 } else { 1.0 };
+                
+                let inv_vp = vp.inverse();
+                let near_point = inv_vp.project_point3(glam::Vec3::new(state.mouse_ndc_x, state.mouse_ndc_y, 0.0));
+                let far_point = inv_vp.project_point3(glam::Vec3::new(state.mouse_ndc_x, state.mouse_ndc_y, 1.0));
+                let ray_dir = (far_point - near_point).normalize();
+                
+                let plane_normal = (target_vec - eye_vec).normalize();
+                let denom = ray_dir.dot(plane_normal);
+                if denom.abs() > 1e-6 {
+                    let t = -eye_vec.dot(plane_normal) / denom;
+                    let mouse_3d = eye_vec + ray_dir * t;
+                    
+                    // Acotar la fuerza dentro de la urna de cristal
+                    let limit = spacing_val * 1.06;
+                    let mx = mouse_3d.x.clamp(-limit, limit);
+                    let my = mouse_3d.y.clamp(-limit, limit);
+                    let mz = mouse_3d.z.clamp(-limit, limit);
+                    
+                    mouse_pos_val = [mx, my, mz, 0.0];
+                } else {
+                    mouse_active_val = 0.0;
+                }
+            }
+            
+            (eye_pos, vp.to_cols_array(), mouse_active_val, mouse_pos_val)
         };
+
+        // Escribir los parámetros de cómputo (físicas dinámicas en GPU)
+        let compute_params_data = ComputeParams {
+            spacing: spacing_val,
+            delta_time: dt,
+            intensity: light_val,
+            mouse_active: mouse_active_val,
+            mouse_pos: mouse_pos_val,
+        };
+        unsafe {
+            queue.write_buffer(&compute_params_buffer, 0, any_as_u8_slice(&compute_params_data));
+        }
 
         // C. SUBIR DATOS DE CÁMARA A LA GPU
         let camera_data = CameraUniform {
@@ -893,11 +1637,48 @@ pub async fn start() -> Result<(), JsValue> {
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Physics Compute Pass"),
-                timestamp_writes: None,
+                timestamp_writes: query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }),
             });
-            compute_pass.set_pipeline(&compute_pipeline);
-            compute_pass.set_bind_group(0, &compute_bind_group, &[]);
-            compute_pass.dispatch_workgroups(7, 1, 1); // 1,728 partículas / 256 workgroup_size = 6.75 -> 7 grupos
+
+            // 1. Paso 1: Generación de Hash Spatial Hashing
+            compute_pass.set_pipeline(&hash_gen_pipeline);
+            compute_pass.set_bind_group(0, &compute_bind_group, &[0]);
+            compute_pass.dispatch_workgroups((num_particles as u32) / 256, 1, 1);
+
+            // 2. Paso 2: Ordenamiento masivo en GPU (Bitonic Merge Sort)
+            compute_pass.set_pipeline(&bitonic_sort_pipeline);
+            let mut step_idx = 0;
+            let mut stage = 2u32;
+            while stage <= num_particles as u32 {
+                let mut step = stage / 2;
+                while step > 0 {
+                    let offset = step_offsets[step_idx] * 4; // offset en bytes
+                    compute_pass.set_bind_group(0, &compute_bind_group, &[offset]);
+                    compute_pass.dispatch_workgroups((num_particles as u32) / 256, 1, 1);
+                    step_idx += 1;
+                    step /= 2;
+                }
+                stage *= 2;
+            }
+
+            // 3. Paso 3: offsets de celdas
+            compute_pass.set_pipeline(&cell_offsets_pipeline);
+            compute_pass.set_bind_group(0, &compute_bind_group, &[0]);
+            compute_pass.dispatch_workgroups((num_particles as u32) / 256, 1, 1);
+
+            // 4. Paso 4: densidad y presión de fluido SPH
+            compute_pass.set_pipeline(&sph_density_pipeline);
+            compute_pass.set_bind_group(0, &compute_bind_group, &[0]);
+            compute_pass.dispatch_workgroups((num_particles as u32) / 256, 1, 1);
+
+            // 5. Paso 5: integración de fuerzas SPH (Presión + Viscosidad + Remolino)
+            compute_pass.set_pipeline(&sph_force_pipeline);
+            compute_pass.set_bind_group(0, &compute_bind_group, &[0]);
+            compute_pass.dispatch_workgroups((num_particles as u32) / 256, 1, 1);
         }
 
         // =====================================================================
@@ -908,7 +1689,7 @@ pub async fn start() -> Result<(), JsValue> {
                 label: Some("Interactive Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &msaa_texture_view,
-                    resolve_target: Some(&view),
+                    resolve_target: Some(&hdr_texture_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.015,
@@ -928,20 +1709,24 @@ pub async fn start() -> Result<(), JsValue> {
                     stencil_ops: None,
                 }),
                 occlusion_query_set: None,
-                timestamp_writes: None,
+                timestamp_writes: query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(2),
+                    end_of_pass_write_index: Some(3),
+                }),
             });
 
-            // 1. Dibujamos el lattice de líneas conectadas en 3D (9504 vértices)
+            // 1. Líneas de fuerza / velocidad: 2 vértices por partícula (cola + cabeza del vector)
             render_pass.set_pipeline(&line_pipeline_clone);
             render_pass.set_bind_group(0, &bind_group, &[]);
             render_pass.set_bind_group(1, &bind_group_1, &[]);
-            render_pass.draw(0..9504, 0..1);
+            render_pass.draw(0..((num_particles as u32) * 2), 0..1);
 
-            // 2. Dibujamos los puntos nítidos de las partículas (10368 vértices)
+            // 2. Dibujamos los puntos nítidos de las partículas (65,536 partículas * 6 vértices por billboard)
             render_pass.set_pipeline(&render_pipeline);
             render_pass.set_bind_group(0, &bind_group, &[]);
             render_pass.set_bind_group(1, &bind_group_1, &[]);
-            render_pass.draw(0..10368, 0..1);
+            render_pass.draw(0..((num_particles as u32) * 6), 0..1);
 
             // 3. Dibujamos el cristal encasillador exterior (36 vértices procedimentales)
             render_pass.set_pipeline(&glass_pipeline_clone);
@@ -949,7 +1734,138 @@ pub async fn start() -> Result<(), JsValue> {
             render_pass.draw(0..36, 0..1);
         }
 
+        // =====================================================================
+        // PASS 2: EXTRACCIÓN DE BRILLOS (THRESHOLD) Y DOWNSAMPLING A 1/4
+        // =====================================================================
+        {
+            let mut extract_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bright Extract Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &brights_texture_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(4),
+                    end_of_pass_write_index: None,
+                }),
+            });
+            extract_pass.set_pipeline(&bright_extract_pipeline_clone);
+            extract_pass.set_bind_group(0, &extract_bind_group, &[]);
+            extract_pass.draw(0..3, 0..1);
+        }
+
+        // =====================================================================
+        // PASS 3: BLUR HORIZONTAL EN 1/4 RESOLUCIÓN
+        // =====================================================================
+        {
+            let mut blur_h_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Blur Horizontal Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &blur_temp_texture_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            blur_h_pass.set_pipeline(&blur_h_pipeline_clone);
+            blur_h_pass.set_bind_group(0, &blur_h_bind_group, &[]);
+            blur_h_pass.set_bind_group(1, &blur_params_bind_group_clone, &[]);
+            blur_h_pass.draw(0..3, 0..1);
+        }
+
+        // =====================================================================
+        // PASS 4: BLUR VERTICAL EN 1/4 RESOLUCIÓN
+        // =====================================================================
+        {
+            let mut blur_v_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Blur Vertical Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &brights_texture_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            blur_v_pass.set_pipeline(&blur_v_pipeline_clone);
+            blur_v_pass.set_bind_group(0, &blur_v_bind_group, &[]);
+            blur_v_pass.set_bind_group(1, &blur_params_bind_group_clone, &[]);
+            blur_v_pass.draw(0..3, 0..1);
+        }
+
+        // =====================================================================
+        // PASS 5: COMPOSICIÓN DE BLOOM, ACES TONEMAPPING Y CORRECCIÓN GAMMA
+        // =====================================================================
+        {
+            let mut compose_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Post Process Compose Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.015,
+                            g: 0.012,
+                            b: 0.02,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: None,
+                    end_of_pass_write_index: Some(5),
+                }),
+            });
+            compose_pass.set_pipeline(&post_process_pipeline_clone);
+            compose_pass.set_bind_group(0, &bind_group, &[]);
+            compose_pass.set_bind_group(1, &composite_bind_group, &[]);
+            compose_pass.draw(0..3, 0..1);
+        }
+
         queue.submit(std::iter::once(encoder.finish()));
+
+        if supports_timestamp {
+            if query_set.is_some() && query_buffer.is_some() && query_readback_buffer.is_some() {
+                let query_pending_clone = query_pending.clone();
+                if !query_pending_clone.load(Ordering::SeqCst) {
+                    query_pending_clone.store(true, Ordering::SeqCst);
+
+                    let qs = query_set.as_ref().unwrap();
+                    let qb = query_buffer.as_ref().unwrap();
+                    let qrb = query_readback_buffer.as_ref().unwrap().clone();
+
+                    map_and_read_timestamps(qrb.clone(), query_pending_clone, timestamp_period);
+
+                    let mut resolve_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Resolve Query Encoder"),
+                    });
+                    resolve_encoder.resolve_query_set(qs, 0..6, qb, 0);
+                    resolve_encoder.copy_buffer_to_buffer(qb, 0, &qrb, 0, 48);
+                    queue.submit(std::iter::once(resolve_encoder.finish()));
+                }
+            }
+        }
+
         frame.present();
 
         request_animation_frame(f.borrow().as_ref().unwrap());
@@ -965,6 +1881,70 @@ fn request_animation_frame(f: &Closure<dyn FnMut()>) {
         .unwrap()
         .request_animation_frame(f.as_ref().unchecked_ref())
         .unwrap();
+}
+
+#[allow(unused_variables)]
+fn update_gpu_timing_hud(compute_ms: f64, render_ms: f64, postprocess_ms: f64, total_ms: f64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(func) = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("updateGpuTimingHud")) {
+                if !func.is_undefined() && !func.is_null() {
+                    if let Some(f) = func.dyn_ref::<js_sys::Function>() {
+                        let this_val = wasm_bindgen::JsValue::NULL;
+                        let args = js_sys::Array::new();
+                        args.push(&wasm_bindgen::JsValue::from_f64(compute_ms));
+                        args.push(&wasm_bindgen::JsValue::from_f64(render_ms));
+                        args.push(&wasm_bindgen::JsValue::from_f64(postprocess_ms));
+                        args.push(&wasm_bindgen::JsValue::from_f64(total_ms));
+                        let _ = f.apply(&this_val, &args);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn map_and_read_timestamps(
+    qrb: Arc<wgpu::Buffer>,
+    query_pending: Arc<AtomicBool>,
+    timestamp_period: f64,
+) {
+    let qrb_clone = qrb.clone();
+    qrb.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+        if result.is_ok() {
+            let data = qrb_clone.slice(..).get_mapped_range();
+            let timestamps = unsafe {
+                std::slice::from_raw_parts(
+                    data.as_ptr() as *const u64,
+                    data.len() / 8,
+                )
+            };
+
+            if timestamps.len() >= 6 {
+                let t0 = timestamps[0];
+                let t1 = timestamps[1];
+                let t2 = timestamps[2];
+                let t3 = timestamps[3];
+                let t4 = timestamps[4];
+                let t5 = timestamps[5];
+
+                let compute_time = if t1 >= t0 { (t1 - t0) as f64 * timestamp_period } else { 0.0 };
+                let render_time = if t3 >= t2 { (t3 - t2) as f64 * timestamp_period } else { 0.0 };
+                let postprocess_time = if t5 >= t4 { (t5 - t4) as f64 * timestamp_period } else { 0.0 };
+
+                let compute_ms = compute_time / 1_000_000.0;
+                let render_ms = render_time / 1_000_000.0;
+                let postprocess_ms = postprocess_time / 1_000_000.0;
+                let total_ms = compute_ms + render_ms + postprocess_ms;
+
+                update_gpu_timing_hud(compute_ms, render_ms, postprocess_ms, total_ms);
+            }
+            drop(data);
+            qrb_clone.unmap();
+        }
+        query_pending.store(false, Ordering::SeqCst);
+    });
 }
 
 #[cfg(test)]
@@ -997,6 +1977,58 @@ mod tests {
             Err(e) => {
                 let error_msg = e.emit_to_string(&shader_source);
                 panic!("Parsing Error:\n{}", error_msg);
+            }
+        }
+    }
+
+    #[test]
+    fn test_postprocess_shader() {
+        let postprocess = include_str!("shaders/postprocess.wgsl");
+        let mut frontend = wgpu::naga::front::wgsl::Frontend::new();
+        match frontend.parse(postprocess) {
+            Ok(module) => {
+                println!("Postprocess Shader parsed successfully!");
+                let mut validator = wgpu::naga::valid::Validator::new(
+                    wgpu::naga::valid::ValidationFlags::all(),
+                    wgpu::naga::valid::Capabilities::all(),
+                );
+                match validator.validate(&module) {
+                    Ok(_) => println!("Postprocess Shader validated successfully!"),
+                    Err(e) => {
+                        let error_msg = e.emit_to_string(postprocess);
+                        panic!("Postprocess Validation Error:\n{}", error_msg);
+                    }
+                }
+            }
+            Err(e) => {
+                let error_msg = e.emit_to_string(postprocess);
+                panic!("Postprocess Parsing Error:\n{}", error_msg);
+            }
+        }
+    }
+
+    #[test]
+    fn test_compute_shader() {
+        let compute = include_str!("shaders/compute.wgsl");
+        let mut frontend = wgpu::naga::front::wgsl::Frontend::new();
+        match frontend.parse(compute) {
+            Ok(module) => {
+                println!("Compute Shader parsed successfully!");
+                let mut validator = wgpu::naga::valid::Validator::new(
+                    wgpu::naga::valid::ValidationFlags::all(),
+                    wgpu::naga::valid::Capabilities::all(),
+                );
+                match validator.validate(&module) {
+                    Ok(_) => println!("Compute Shader validated successfully!"),
+                    Err(e) => {
+                        let error_msg = e.emit_to_string(compute);
+                        panic!("Compute Validation Error:\n{}", error_msg);
+                    }
+                }
+            }
+            Err(e) => {
+                let error_msg = e.emit_to_string(compute);
+                panic!("Compute Parsing Error:\n{}", error_msg);
             }
         }
     }

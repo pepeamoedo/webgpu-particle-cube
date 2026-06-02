@@ -29,6 +29,7 @@ features = [
   "ResizeObserver",
   "ResizeObserverEntry",
   "DomRectReadOnly",
+  "DomRect",
   "Gpu",
   "GpuAdapter",
   "GpuDevice",

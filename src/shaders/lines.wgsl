@@ -1,13 +1,13 @@
 // =====================================================================
-// PROCESO: Generador de Líneas del Lattice (Line List)
+// PROCESO: Líneas de Fuerza / Velocidad (Streamlines del Fluido)
+// Cada partícula genera un segmento: tail=pos, head=pos+vel*scale
 // =====================================================================
-
-
 
 
 struct LineVertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
+    @location(1) alpha: f32,
 };
 
 @vertex
@@ -15,70 +15,59 @@ fn vs_line(
     @builtin(vertex_index) in_vertex_index: u32,
 ) -> LineVertexOutput {
     var out: LineVertexOutput;
-    
-    let segment_index = in_vertex_index / 2u;
-    let vertex_in_segment = in_vertex_index % 2u;
-    
-    var idx: u32 = 0u;
-    
-    if (segment_index < 1584u) {
-        // Segmentos alineados en X
-        let ix = segment_index % 11u;
-        let iy = (segment_index / 11u) % 12u;
-        let iz = segment_index / 132u;
-        
-        let start_idx = iz * 144u + iy * 12u + ix;
-        if (vertex_in_segment == 0u) {
-            idx = start_idx;
-        } else {
-            idx = start_idx + 1u;
-        }
-    } else if (segment_index < 3168u) {
-        // Segmentos alineados en Y
-        let local_seg = segment_index - 1584u;
-        let ix = local_seg % 12u;
-        let iy = (local_seg / 12u) % 11u;
-        let iz = local_seg / 132u;
-        
-        let start_idx = iz * 144u + iy * 12u + ix;
-        if (vertex_in_segment == 0u) {
-            idx = start_idx;
-        } else {
-            idx = start_idx + 12u;
-        }
-    } else {
-        // Segmentos alineados en Z
-        let local_seg = segment_index - 3168u;
-        let ix = local_seg % 12u;
-        let iy = (local_seg / 12u) % 12u;
-        let iz = local_seg / 144u;
-        
-        let start_idx = iz * 144u + iy * 12u + ix;
-        if (vertex_in_segment == 0u) {
-            idx = start_idx;
-        } else {
-            idx = start_idx + 144u;
-        }
-    }
-    
-    let p = particles[idx];
+
+    // Cada partícula genera 2 vértices: índice par = cola, índice impar = cabeza
+    let particle_idx = in_vertex_index / 2u;
+    let is_head = (in_vertex_index % 2u) == 1u;
+
+    let p = particles[particle_idx];
     let pos = p.pos.xyz;
-    
-    // Mapeo dinámico y fluido de degradado cromático en caliente según la posición física real
-    let spacing = lighting.params.y;
-    let r = (p.pos.x / (spacing * 2.0) + 0.5);
-    let g = (p.pos.y / (spacing * 2.0) + 0.5);
-    let b = (p.pos.z / (spacing * 2.0) + 0.5);
-    out.color = vec3<f32>(r * 0.9 + 0.1, g * 0.9 + 0.1, b * 0.9 + 0.1);
-    
-    out.clip_position = camera.view_proj * vec4<f32>(pos, 1.0);
+    let vel = p.vel.xyz;
+
+    // Escala de las líneas de fuerza: ajusta para la urna unitaria
+    let line_scale: f32 = 0.12;
+
+    var world_pos: vec3<f32>;
+    if (is_head) {
+        world_pos = pos + vel * line_scale;
+    } else {
+        world_pos = pos;
+    }
+
+    // Velocidad: magnitud para colorear el gradiente
+    let speed = length(vel);
+    let speed_norm = clamp(speed / 2.5, 0.0, 1.0); // normalizar contra v_max del compute
+
+    // Espectro de calor: azul → cian → verde → amarillo → naranja → rojo
+    var col: vec3<f32>;
+    if (speed_norm < 0.25) {
+        let t = speed_norm / 0.25;
+        col = mix(vec3<f32>(0.05, 0.1, 0.9),  vec3<f32>(0.0,  0.8, 0.9),  t);
+    } else if (speed_norm < 0.5) {
+        let t = (speed_norm - 0.25) / 0.25;
+        col = mix(vec3<f32>(0.0,  0.8, 0.9),  vec3<f32>(0.1,  0.9, 0.2),  t);
+    } else if (speed_norm < 0.75) {
+        let t = (speed_norm - 0.5) / 0.25;
+        col = mix(vec3<f32>(0.1,  0.9, 0.2),  vec3<f32>(1.0,  0.8, 0.0),  t);
+    } else {
+        let t = (speed_norm - 0.75) / 0.25;
+        col = mix(vec3<f32>(1.0,  0.8, 0.0),  vec3<f32>(1.0,  0.15, 0.05), t);
+    }
+
+    // La cabeza del vector brilla más (énfasis en la dirección)
+    let brightness = select(0.5, 1.2, is_head);
+    out.color = col * brightness;
+
+    // Transparencia proporcional a la velocidad (líneas muy lentas son casi invisibles)
+    out.alpha = clamp(speed_norm * 2.5, 0.08, 0.85);
+
+    out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     return out;
 }
 
 @fragment
 fn fs_line(in: LineVertexOutput) -> @location(0) vec4<f32> {
     let intensity = lighting.params.z;
-    // Multiplicar el color del degradado directamente por la intensidad para un brillo neón potente y visible
-    let final_color = in.color * intensity * 0.8;
-    return vec4<f32>(final_color, 0.45); // Alfa del 45% para que se vean como hilos finos y elegantes con mezcla aditiva
+    let final_color = in.color * intensity * 1.4;
+    return vec4<f32>(final_color, in.alpha);
 }
