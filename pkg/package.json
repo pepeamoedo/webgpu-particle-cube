@@ -1,0 +1,15 @@
+{
+  "name": "webgpu_wasm_triangle",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "webgpu_wasm_triangle_bg.wasm",
+    "webgpu_wasm_triangle.js",
+    "webgpu_wasm_triangle.d.ts"
+  ],
+  "main": "webgpu_wasm_triangle.js",
+  "types": "webgpu_wasm_triangle.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
