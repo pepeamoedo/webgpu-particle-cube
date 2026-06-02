@@ -759,23 +759,26 @@ pub async fn start() -> Result<(), JsValue> {
 
         if resized {
             let dpr = window_clone.device_pixel_ratio();
-            physical_width = (w * dpr) as u32;
-            physical_height = (h * dpr) as u32;
+            let new_physical_width = (w * dpr) as u32;
+            let new_physical_height = (h * dpr) as u32;
             
-            canvas_clone.set_width(physical_width);
-            canvas_clone.set_height(physical_height);
-            
-            let canvas_style = canvas_clone.style();
-            canvas_style.set_property("width", &format!("{}px", w)).unwrap();
-            canvas_style.set_property("height", &format!("{}px", h)).unwrap();
-            
-            config.width = physical_width;
-            config.height = physical_height;
-            surface.configure(&device, &config);
-            
-            // Recrear texturas MSAA y profundidad para coincidir con la resolución física exacta
-            msaa_texture_view = create_multisampled_framebuffer(&device, &config);
-            depth_texture_view = create_depth_texture(&device, &config);
+            if new_physical_width > 0 && new_physical_height > 0 && 
+               (new_physical_width != physical_width || new_physical_height != physical_height) {
+                
+                physical_width = new_physical_width;
+                physical_height = new_physical_height;
+                
+                canvas_clone.set_width(physical_width);
+                canvas_clone.set_height(physical_height);
+                
+                config.width = physical_width;
+                config.height = physical_height;
+                surface.configure(&device, &config);
+                
+                // Recrear texturas MSAA y profundidad para coincidir con la resolución física exacta
+                msaa_texture_view = create_multisampled_framebuffer(&device, &config);
+                depth_texture_view = create_depth_texture(&device, &config);
+            }
         }
 
         // A2. ACTUALIZAR PARÁMETROS DEL PANEL DE CONTROL EN TIEMPO REAL
