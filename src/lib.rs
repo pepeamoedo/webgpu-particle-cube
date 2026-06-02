@@ -1716,11 +1716,11 @@ pub async fn start() -> Result<(), JsValue> {
                 }),
             });
 
-            // 1. Líneas de fuerza / velocidad: 2 vértices por partícula (cola + cabeza del vector)
+            // Líneas de fuerza: desactivadas
             render_pass.set_pipeline(&line_pipeline_clone);
             render_pass.set_bind_group(0, &bind_group, &[]);
             render_pass.set_bind_group(1, &bind_group_1, &[]);
-            render_pass.draw(0..((num_particles as u32) * 2), 0..1);
+            render_pass.draw(0..0, 0..1);
 
             // 2. Dibujamos los puntos nítidos de las partículas (65,536 partículas * 6 vértices por billboard)
             render_pass.set_pipeline(&render_pipeline);
