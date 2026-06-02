@@ -116,7 +116,7 @@ fn create_multisampled_framebuffer(device: &wgpu::Device, config: &wgpu::Surface
 #[wasm_bindgen(start)]
 pub async fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Debug).expect("No se pudo inicializar console_log");
+    let _ = console_log::init_with_level(log::Level::Debug);
     
     log::info!("Iniciando Motor de Partículas WebGPU...");
 
@@ -498,6 +498,13 @@ pub async fn start() -> Result<(), JsValue> {
         push_constant_ranges: &[],
     });
 
+    // Crear Glass Pipeline Layout (solo slot 0 con Uniforms, igual al original)
+    let glass_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Glass Pipeline Layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
     // Crear Compute Pipeline Layout
     let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Compute Pipeline Layout"),
@@ -621,7 +628,7 @@ pub async fn start() -> Result<(), JsValue> {
 
     let glass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("Glass Pipeline"),
-        layout: Some(&render_pipeline_layout),
+        layout: Some(&glass_pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: "vs_glass",
@@ -938,7 +945,6 @@ pub async fn start() -> Result<(), JsValue> {
             // 3. Dibujamos el cristal encasillador exterior (36 vértices procedimentales)
             render_pass.set_pipeline(&glass_pipeline_clone);
             render_pass.set_bind_group(0, &bind_group, &[]);
-            render_pass.set_bind_group(1, &bind_group_1, &[]);
             render_pass.draw(0..36, 0..1);
         }
 
