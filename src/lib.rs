@@ -89,6 +89,21 @@ struct SortParams {
     pad1: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[allow(dead_code)]
+struct SsfrParams {
+    near:          f32,
+    far:           f32,
+    particle_r:    f32,
+    aspect:        f32,
+    fluid_color:   [f32; 4],
+    texel_size:    [f32; 2],
+    tan_half_fov:  f32,
+    _pad:          f32,
+    light_dir_vs:  [f32; 4],
+}
+
 // =====================================================================
 // ESTADO DE CÁMARA ORBITAL Y VIEWPORT
 // =====================================================================
@@ -187,6 +202,44 @@ fn create_bloom_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfigurati
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+// Textura Rgba16Float a resolución completa (para SSFR depth, blur, normal, final HDR)
+fn create_float_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration, label: &str) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+// Depth stencil single-sample para el depth pass de esferas SSFR
+fn create_ssfr_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("SSFR Sphere Depth Stencil"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth24Plus,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
@@ -1243,6 +1296,199 @@ pub async fn start() -> Result<(), JsValue> {
     log::info!("Pipelines, Storage y Uniforms inicializados. Lanzando bucle interactivo.");
 
     // =====================================================================
+    // SSFR — SCREEN SPACE FLUID RENDERING — PIPELINES
+    // =====================================================================
+
+    // Layout para el uniform SsfrParams (usado en group 2 del depth pass, group 1 de los post passes)
+    let ssfr_params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("SSFR Params Layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    // Layout para la textura de fondo del shade pass (solo una textura en binding 0)
+    let single_tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("SSFR Single Texture Layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            },
+            count: None,
+        }],
+    });
+
+    // Buffer de parámetros SSFR (actualizado cada frame)
+    let ssfr_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("SSFR Params Buffer"),
+        size: std::mem::size_of::<SsfrParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Bind group inmutable (apunta al buffer, no a texturas — no cambia en resize)
+    let ssfr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("SSFR Params Bind Group"),
+        layout: &ssfr_params_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: ssfr_params_buffer.as_entire_binding(),
+        }],
+    });
+
+    // Shader modules SSFR
+    let ssfr_depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("SSFR Depth Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/ssfr.wgsl").into()),
+    });
+    let ssfr_post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("SSFR Post Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/ssfr_post.wgsl").into()),
+    });
+
+    // Pipeline layouts SSFR
+    let ssfr_depth_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("SSFR Depth Pipeline Layout"),
+        bind_group_layouts: &[&bind_group_layout, &bind_group_layout_1, &ssfr_params_layout],
+        push_constant_ranges: &[],
+    });
+    let ssfr_post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("SSFR Post Pipeline Layout"),
+        bind_group_layouts: &[&texture_sampler_bind_group_layout, &ssfr_params_layout],
+        push_constant_ranges: &[],
+    });
+    let ssfr_shade_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("SSFR Shade Pipeline Layout"),
+        bind_group_layouts: &[&texture_sampler_bind_group_layout, &ssfr_params_layout, &single_tex_layout],
+        push_constant_ranges: &[],
+    });
+
+    // Pipeline 1: Profundidad de esferas (con depth stencil single-sample para ordering)
+    let ssfr_depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("SSFR Sphere Depth Pipeline"),
+        layout: Some(&ssfr_depth_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &ssfr_depth_shader,
+            entry_point: "vs_sphere_depth",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &ssfr_depth_shader,
+            entry_point: "fs_sphere_depth",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24Plus,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    // Pipeline 2: Blur Bilateral Horizontal
+    let bilateral_h_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("SSFR Bilateral H Pipeline"),
+        layout: Some(&ssfr_post_pipeline_layout),
+        vertex: wgpu::VertexState { module: &ssfr_post_shader, entry_point: "vs_ssfr_quad", buffers: &[] },
+        fragment: Some(wgpu::FragmentState {
+            module: &ssfr_post_shader,
+            entry_point: "fs_bilateral_h",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    // Pipeline 3: Blur Bilateral Vertical
+    let bilateral_v_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("SSFR Bilateral V Pipeline"),
+        layout: Some(&ssfr_post_pipeline_layout),
+        vertex: wgpu::VertexState { module: &ssfr_post_shader, entry_point: "vs_ssfr_quad", buffers: &[] },
+        fragment: Some(wgpu::FragmentState {
+            module: &ssfr_post_shader,
+            entry_point: "fs_bilateral_v",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    // Pipeline 4: Reconstrucción de Normales
+    let normal_reconstruct_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("SSFR Normal Reconstruct Pipeline"),
+        layout: Some(&ssfr_post_pipeline_layout),
+        vertex: wgpu::VertexState { module: &ssfr_post_shader, entry_point: "vs_ssfr_quad", buffers: &[] },
+        fragment: Some(wgpu::FragmentState {
+            module: &ssfr_post_shader,
+            entry_point: "fs_normal_reconstruct",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    // Pipeline 5: Sombreado de Mercurio Líquido
+    let fluid_shade_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("SSFR Fluid Shade Pipeline"),
+        layout: Some(&ssfr_shade_pipeline_layout),
+        vertex: wgpu::VertexState { module: &ssfr_post_shader, entry_point: "vs_ssfr_quad", buffers: &[] },
+        fragment: Some(wgpu::FragmentState {
+            module: &ssfr_post_shader,
+            entry_point: "fs_fluid_shade",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+
+    // =====================================================================
     // NATIVE RESIZEOBSERVER PARA ELIMINAR EL LAYOUT THRASHING
     // =====================================================================
     let viewport_state = Rc::new(RefCell::new(ViewportState {
@@ -1279,6 +1525,13 @@ pub async fn start() -> Result<(), JsValue> {
     let mut brights_texture_view = create_bloom_texture(&device, &config, "Brights Texture");
     let mut blur_temp_texture_view = create_bloom_texture(&device, &config, "Blur Temp Texture");
 
+    // Texturas SSFR a resolución completa
+    let mut fluid_depth_tex     = create_float_texture(&device, &config, "SSFR Fluid Depth");
+    let mut fluid_blur_a_tex    = create_float_texture(&device, &config, "SSFR Fluid Blur A");
+    let mut fluid_normal_tex    = create_float_texture(&device, &config, "SSFR Fluid Normals");
+    let mut final_hdr_tex       = create_float_texture(&device, &config, "SSFR Final HDR");
+    let mut ssfr_depth_stencil  = create_ssfr_depth(&device, &config);
+
     // Inicializar QuerySet y buffers de perfilado si está soportado
     let query_set = if supports_timestamp {
         Some(device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -1312,12 +1565,46 @@ pub async fn start() -> Result<(), JsValue> {
         None
     };
 
-    // Crear bind groups iniciales
+    // Crear bind groups SSFR (se recrcan en resize con nuevas vistas de textura)
+    let mut fluid_depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("SSFR Fluid Depth BG"),
+        layout: &texture_sampler_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&fluid_depth_tex) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler) },
+        ],
+    });
+    let mut fluid_blur_a_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("SSFR Fluid Blur A BG"),
+        layout: &texture_sampler_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&fluid_blur_a_tex) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler) },
+        ],
+    });
+    let mut fluid_normal_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("SSFR Fluid Normal BG"),
+        layout: &texture_sampler_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&fluid_normal_tex) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler) },
+        ],
+    });
+    // Textura de fondo para el shade pass (escena background, sin las partículas)
+    let mut scene_single_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("SSFR Scene Single BG"),
+        layout: &single_tex_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+        ],
+    });
+
+    // Crear bind groups iniciales (extract y composite ahora usan final_hdr_tex)
     let mut extract_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Extract Bind Group"),
         layout: &texture_sampler_bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&final_hdr_tex) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler) },
         ],
     });
@@ -1344,7 +1631,7 @@ pub async fn start() -> Result<(), JsValue> {
         label: Some("Composite Bind Group"),
         layout: &composite_bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&final_hdr_tex) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&brights_texture_view) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&post_process_sampler) },
         ],
@@ -1399,6 +1686,17 @@ pub async fn start() -> Result<(), JsValue> {
     let post_process_sampler_clone = Rc::new(post_process_sampler);
     let blur_params_buffer_clone = Rc::new(blur_params_buffer);
 
+    // Clones de recursos SSFR para el bucle de renderizado
+    let ssfr_depth_pipeline_clone = Rc::new(ssfr_depth_pipeline);
+    let bilateral_h_pipeline_clone = Rc::new(bilateral_h_pipeline);
+    let bilateral_v_pipeline_clone = Rc::new(bilateral_v_pipeline);
+    let normal_reconstruct_pipeline_clone = Rc::new(normal_reconstruct_pipeline);
+    let fluid_shade_pipeline_clone = Rc::new(fluid_shade_pipeline);
+    let ssfr_bg_clone = Rc::new(ssfr_bg);
+    let ssfr_params_buffer_clone = Rc::new(ssfr_params_buffer);
+    let single_tex_layout_clone = Rc::new(single_tex_layout);
+
+
     let _observer_keep_alive = observer; // Mantener vivo el ResizeObserver moviéndolo al contexto
 
     let mut last_size_val = -1.0f32;
@@ -1444,6 +1742,13 @@ pub async fn start() -> Result<(), JsValue> {
                 brights_texture_view = create_bloom_texture(&device, &config, "Brights Texture");
                 blur_temp_texture_view = create_bloom_texture(&device, &config, "Blur Temp Texture");
 
+                // Recrear texturas SSFR
+                fluid_depth_tex    = create_float_texture(&device, &config, "SSFR Fluid Depth");
+                fluid_blur_a_tex   = create_float_texture(&device, &config, "SSFR Fluid Blur A");
+                fluid_normal_tex   = create_float_texture(&device, &config, "SSFR Fluid Normals");
+                final_hdr_tex      = create_float_texture(&device, &config, "SSFR Final HDR");
+                ssfr_depth_stencil = create_ssfr_depth(&device, &config);
+
                 // Escribir los nuevos parámetros de desenfoque
                 let low_res_w = (physical_width / 4).max(1) as f32;
                 let low_res_h = (physical_height / 4).max(1) as f32;
@@ -1455,12 +1760,45 @@ pub async fn start() -> Result<(), JsValue> {
                     queue.write_buffer(&blur_params_buffer_clone, 0, any_as_u8_slice(&blur_params));
                 }
 
-                // Recrear bind groups con las nuevas vistas de texturas
+                // Recrear bind groups SSFR con nuevas vistas de textura
+                fluid_depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SSFR Fluid Depth BG"),
+                    layout: &texture_sampler_bind_group_layout_clone,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&fluid_depth_tex) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler_clone) },
+                    ],
+                });
+                fluid_blur_a_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SSFR Fluid Blur A BG"),
+                    layout: &texture_sampler_bind_group_layout_clone,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&fluid_blur_a_tex) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler_clone) },
+                    ],
+                });
+                fluid_normal_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SSFR Fluid Normal BG"),
+                    layout: &texture_sampler_bind_group_layout_clone,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&fluid_normal_tex) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler_clone) },
+                    ],
+                });
+                scene_single_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SSFR Scene Single BG"),
+                    layout: &single_tex_layout_clone,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+                    ],
+                });
+
+                // Recrear bind groups de bloom con las nuevas vistas de texturas
                 extract_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Extract Bind Group"),
                     layout: &texture_sampler_bind_group_layout_clone,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&final_hdr_tex) },
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_process_sampler_clone) },
                     ],
                 });
@@ -1487,7 +1825,7 @@ pub async fn start() -> Result<(), JsValue> {
                     label: Some("Composite Bind Group"),
                     layout: &composite_bind_group_layout_clone,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_texture_view) },
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&final_hdr_tex) },
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&brights_texture_view) },
                         wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&post_process_sampler_clone) },
                     ],
@@ -1533,7 +1871,7 @@ pub async fn start() -> Result<(), JsValue> {
         }
 
         // B. CALCULAR PROCESO DE CÁMARA E INTERACCIÓN (SIMD Glam Math con Inercia)
-        let (eye, view_proj, mouse_active_val, mouse_pos_val) = {
+        let (eye, view_proj, mouse_active_val, mouse_pos_val, light_dir_view_val) = {
             let mut state = camera_state.borrow_mut();
             
             // Interpolación exponencial amortiguada independiente de la tasa de refresco
@@ -1593,7 +1931,12 @@ pub async fn start() -> Result<(), JsValue> {
                 }
             }
             
-            (eye_pos, vp.to_cols_array(), mouse_active_val, mouse_pos_val)
+            // Transformar dirección de luz (world-space) al view-space para el shade pass
+            let world_light = glam::Vec3::new(1.0, 1.5, 1.0).normalize();
+            let view_light  = view.transform_vector3(world_light);
+            let light_dir_view_val: [f32; 4] = [view_light.x, view_light.y, view_light.z, 0.0];
+
+            (eye_pos, vp.to_cols_array(), mouse_active_val, mouse_pos_val, light_dir_view_val)
         };
 
         // Escribir los parámetros de cómputo (físicas dinámicas en GPU)
@@ -1615,6 +1958,26 @@ pub async fn start() -> Result<(), JsValue> {
         };
         unsafe {
             queue.write_buffer(&camera_buffer, 0, any_as_u8_slice(&camera_data));
+        }
+
+        // C2. ACTUALIZAR PARAMS SSFR (aspecto, texel_size, luz en view-space)
+        let ssfr_aspect = if physical_height > 0 { physical_width as f32 / physical_height as f32 } else { 1.0 };
+        let ssfr_data = SsfrParams {
+            near:         0.1,
+            far:          100.0,
+            particle_r:   0.12,  // radio de esfera en unidades mundo
+            aspect:       ssfr_aspect,
+            fluid_color:  [0.78, 0.84, 0.92, 1.0],  // plata azulada fría (mercurio)
+            texel_size:   [
+                if physical_width  > 0 { 1.0 / physical_width  as f32 } else { 1.0 },
+                if physical_height > 0 { 1.0 / physical_height as f32 } else { 1.0 },
+            ],
+            tan_half_fov: (22.5f32.to_radians()).tan(),  // FOV 45° → half = 22.5°
+            _pad:         0.0,
+            light_dir_vs: light_dir_view_val,
+        };
+        unsafe {
+            queue.write_buffer(&ssfr_params_buffer_clone, 0, any_as_u8_slice(&ssfr_data));
         }
 
         // D. Obtener fotograma de superficie
@@ -1722,16 +2085,144 @@ pub async fn start() -> Result<(), JsValue> {
             render_pass.set_bind_group(1, &bind_group_1, &[]);
             render_pass.draw(0..0, 0..1);
 
-            // 2. Dibujamos los puntos nítidos de las partículas (65,536 partículas * 6 vértices por billboard)
-            render_pass.set_pipeline(&render_pipeline);
-            render_pass.set_bind_group(0, &bind_group, &[]);
-            render_pass.set_bind_group(1, &bind_group_1, &[]);
-            render_pass.draw(0..((num_particles as u32) * 6), 0..1);
+            // NOTA: Las partículas NO se dibujan aquí — ahora las renderiza SSFR como mercurio líquido
 
-            // 3. Dibujamos el cristal encasillador exterior (36 vértices procedimentales)
+            // 2. Dibujamos el cristal encasillador exterior (36 vértices procedimentales)
             render_pass.set_pipeline(&glass_pipeline_clone);
             render_pass.set_bind_group(0, &bind_group, &[]);
             render_pass.draw(0..36, 0..1);
+        }
+
+        // =====================================================================
+        // SSFR — PASS 1: PROFUNDIDAD DE ESFERAS
+        // Las partículas SPH se renderizan como esferas de profundidad lineal.
+        // =====================================================================
+        {
+            let mut depth_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("SSFR Sphere Depth Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &fluid_depth_tex,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &ssfr_depth_stencil,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            depth_pass.set_pipeline(&ssfr_depth_pipeline_clone);
+            depth_pass.set_bind_group(0, &bind_group, &[]);
+            depth_pass.set_bind_group(1, &bind_group_1, &[]);
+            depth_pass.set_bind_group(2, &ssfr_bg_clone, &[]);
+            depth_pass.draw(0..((num_particles as u32) * 6), 0..1);
+        }
+
+        // =====================================================================
+        // SSFR — PASS 2: BLUR BILATERAL HORIZONTAL
+        // =====================================================================
+        {
+            let mut blur_h = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("SSFR Bilateral H Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &fluid_blur_a_tex,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            blur_h.set_pipeline(&bilateral_h_pipeline_clone);
+            blur_h.set_bind_group(0, &fluid_depth_bg, &[]);
+            blur_h.set_bind_group(1, &ssfr_bg_clone, &[]);
+            blur_h.draw(0..3, 0..1);
+        }
+
+        // =====================================================================
+        // SSFR — PASS 3: BLUR BILATERAL VERTICAL
+        // Escribe de vuelta a fluid_depth_tex (ahora = profundidad suavizada)
+        // =====================================================================
+        {
+            let mut blur_v = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("SSFR Bilateral V Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &fluid_depth_tex,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            blur_v.set_pipeline(&bilateral_v_pipeline_clone);
+            blur_v.set_bind_group(0, &fluid_blur_a_bg, &[]);
+            blur_v.set_bind_group(1, &ssfr_bg_clone, &[]);
+            blur_v.draw(0..3, 0..1);
+        }
+
+        // =====================================================================
+        // SSFR — PASS 4: RECONSTRUCCIÓN DE NORMALES en espacio de vista
+        // =====================================================================
+        {
+            let mut normal_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("SSFR Normal Reconstruct Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &fluid_normal_tex,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            normal_pass.set_pipeline(&normal_reconstruct_pipeline_clone);
+            normal_pass.set_bind_group(0, &fluid_depth_bg, &[]);
+            normal_pass.set_bind_group(1, &ssfr_bg_clone, &[]);
+            normal_pass.draw(0..3, 0..1);
+        }
+
+        // =====================================================================
+        // SSFR — PASS 5: SOMBREADO DE MERCURIO LÍQUIDO
+        // Composta el fluido sobre la escena de fondo → final_hdr_tex
+        // =====================================================================
+        {
+            let mut shade_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("SSFR Fluid Shade Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &final_hdr_tex,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            shade_pass.set_pipeline(&fluid_shade_pipeline_clone);
+            shade_pass.set_bind_group(0, &fluid_normal_bg, &[]);
+            shade_pass.set_bind_group(1, &ssfr_bg_clone, &[]);
+            shade_pass.set_bind_group(2, &scene_single_bg, &[]);
+            shade_pass.draw(0..3, 0..1);
         }
 
         // =====================================================================
