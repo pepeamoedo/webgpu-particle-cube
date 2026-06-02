@@ -3,8 +3,7 @@
 // =====================================================================
 
 
-@group(1) @binding(0)
-var<storage, read> particles: array<Particle>;
+
 
 struct LineVertexOutput {
     @builtin(position) clip_position: vec4<f32>,

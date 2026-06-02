@@ -45,6 +45,30 @@ To maintain maximum performance without any CPU memory footprint, the engine is 
   * **Neon Laser Borders**: Automatically detects face boundaries using local fragment coordinates and overlays a sharp, glowing, 1px cyan border.
   * **Translucent Blending**: Uses alpha blending (`SrcAlpha`/`OneMinusSrcAlpha`) to tint the background particles in a premium dark violet glass color.
 
+
+---
+
+## 🚀 AAA Engine Performance Upgrades
+
+To scale the engine to modern commercial standards, the following advanced optimizations have been fully integrated:
+
+### 1. Parallel GPGPU Physics (Compute Shaders)
+* **Zero-CPU Physics Loop**: Migrated particle simulation entirely to a highly parallel GPU Compute Pass using raw WGSL compute shaders (`compute.wgsl`).
+* **GPU Orbital Physics**: Integrates gravitational attraction towards the origin, a subtle spiral vortex force field, damping limits to ensure stability, and high-performance elastic collision boundary reflections against the walls of the glass box.
+* **Shared Storage Buffer**: The compute shader reads and updates the particle coordinates in a read-write storage buffer (`wgpu::BufferUsages::STORAGE`), which is then bound as a read-only buffer in the vertex shader, eliminating any CPU-to-GPU data copies per frame.
+
+### 2. High-Fidelity 4x MSAA (Multi-Sample Anti-Aliasing)
+* **Retina Sharpness**: Configured multisampled framebuffers and resolved color targets dynamically to achieve flawless, hardware-level anti-aliased glowing neon lines and particle quad billboards.
+* **Multi-Sampled Depth Testing**: Aligned the depth attachment with `sample_count: 4` to preserve precise z-buffer checks for anti-aliased geometries.
+
+### 3. Layout-Reflow-Free DOM (ResizeObserver)
+* **Zero Layout Thrashing**: Resizing events are managed using a native, asynchronous `ResizeObserver` layout guard.
+* **Stable Rendering Loops**: Avoids accessing layout-blocking properties like `window.innerWidth`/`innerHeight` inside requestAnimationFrame loops, preserving 60 FPS performance without thread reflow delays.
+
+### 4. Native & WebGPU DevTools Diagnostics
+* **Naga Validation Unit Tests**: Added a native Rust test suite executing wgpu's `naga` front-end under `cargo test` to validate concatenated WGSL shaders locally on native desktop platforms.
+* **Browser Compilation Hook**: Monkey-patched `GPUDevice.prototype.createShaderModule` in `index.html` to intercept runtime shader initialization and render rich, color-coded diagnostic reports with code carets directly in browser consoles if any warnings or compilation errors are found.
+
 ---
 
 ## 🛠️ Technology Stack

@@ -22,3 +22,6 @@ struct Particle {
     pos: vec4<f32>,
     vel: vec4<f32>,
 };
+
+@group(1) @binding(0)
+var<storage, read> particles: array<Particle>;

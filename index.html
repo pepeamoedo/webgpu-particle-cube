@@ -139,6 +139,56 @@
             console.log("WebGPU monkey-patch para 'maxInterStageShaderComponents' aplicado con éxito.");
         }
 
+        // Monkey-patch GPUDevice.prototype.createShaderModule para capturar y formatear errores de compilación
+        if (typeof GPUDevice !== "undefined" && GPUDevice.prototype.createShaderModule) {
+            const originalCreateShaderModule = GPUDevice.prototype.createShaderModule;
+            GPUDevice.prototype.createShaderModule = function (descriptor) {
+                const shaderModule = originalCreateShaderModule.call(this, descriptor);
+                if (descriptor && descriptor.code) {
+                    const label = descriptor.label || "Unnamed Shader";
+                    const code = descriptor.code;
+                    shaderModule.getCompilationInfo().then((info) => {
+                        if (info.messages && info.messages.length > 0) {
+                            const hasErrors = info.messages.some(msg => msg.type === "error");
+                            if (hasErrors) {
+                                console.error(`%c--- Error de Compilación en Shader "${label}" ---`, "color: #ff3366; font-weight: bold; font-size: 14px;");
+                            } else {
+                                console.warn(`%c--- Advertencias de Compilación en Shader "${label}" ---`, "color: #ffaa00; font-weight: bold; font-size: 14px;");
+                            }
+                            
+                            const lines = code.split("\n");
+                            info.messages.forEach((msg) => {
+                                const typeColor = msg.type === "error" ? "#ff3333" : msg.type === "warning" ? "#ffaa00" : "#00aaff";
+                                console.error(
+                                    `%c[${msg.type.toUpperCase()}] Línea ${msg.lineNum}:${msg.linePos} - ${msg.message}`,
+                                    `color: ${typeColor}; font-weight: bold;`
+                                );
+                                
+                                // Mostrar contexto de la línea de error
+                                const startLine = Math.max(1, msg.lineNum - 3);
+                                const endLine = Math.min(lines.length, msg.lineNum + 3);
+                                for (let i = startLine; i <= endLine; i++) {
+                                    const isErrorLine = i === msg.lineNum;
+                                    const lineText = lines[i - 1];
+                                    const prefix = isErrorLine ? `>> ${i}: ` : `   ${i}: `;
+                                    const style = isErrorLine ? "color: #ff3333; background: #220000; font-weight: bold; font-family: monospace;" : "color: #888888; font-family: monospace;";
+                                    console.error(`%c${prefix}${lineText}`, style);
+                                    if (isErrorLine) {
+                                        const padding = " ".repeat(prefix.length + msg.linePos - 1);
+                                        console.error(`%c${padding}^`, "color: #ff3333; font-weight: bold; font-family: monospace;");
+                                    }
+                                }
+                            });
+                        }
+                    }).catch(err => {
+                        console.error("Error al obtener información de compilación del shader:", err);
+                    });
+                }
+                return shaderModule;
+            };
+            console.log("WebGPU monkey-patch para 'createShaderModule' de captura de errores cargado.");
+        }
+
         import init from "./pkg/webgpu_wasm_triangle.js";
         
         async function run() {

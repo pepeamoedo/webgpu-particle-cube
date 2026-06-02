@@ -45,6 +45,30 @@ Para garantizar un rendimiento absoluto de 60 FPS sin consumo de memoria en la C
   * **Bordes Láser de Neón**: Detecta matemáticamente la cercanía a los límites de las caras del cubo y dibuja un borde luminoso cian ultrafino de 1px.
   * **Cuerpo Semitransparente**: Utiliza mezcla de color alfa estándar (`SrcAlpha`/`OneMinusSrcAlpha`) aportando un tinte violeta oscuro premium.
 
+
+---
+
+## 🚀 Optimizaciones de Rendimiento AAA
+
+Para elevar el motor gráfico a un estándar comercial moderno, se han integrado plenamente las siguientes optimizaciones de nivel AAA:
+
+### 1. Físicas GPGPU en Paralelo (Compute Shaders)
+* **Bucle de Físicas sin Carga de CPU**: Se migró la simulación física de las partículas por completo a un Compute Pass paralelo en la GPU mediante sombreadores de cómputo WGSL (`compute.wgsl`).
+* **Físicas Orbitales en GPU**: Integra atracción gravitatoria hacia el origen, un campo de fuerza de remolino en espiral, límites de amortiguación para estabilidad y rebotes elásticos tridimensionales de alto rendimiento contra las paredes internas de la urna de cristal.
+* **Storage Buffer Compartido**: El compute shader lee y actualiza las coordenadas de las partículas en un búfer de almacenamiento de lectura y escritura (`wgpu::BufferUsages::STORAGE`), el cual se vincula como búfer de solo lectura en el vertex shader. Esto elimina por completo las copias de datos de CPU a GPU por cada fotograma.
+
+### 2. MSAA 4x Físico de Alta Fidelidad (Anti-Aliasing)
+* **Nitidez en Pantallas Retina**: Configura framebuffers multi-muestra y resuelve los objetivos de color dinámicamente para lograr líneas de neón y billboards circulares sin pixelación ni dientes de sierra.
+* **Depth Stencil Multi-Muestra**: Alinea el z-buffer con un `sample_count: 4` para preservar la precisión física de las pruebas de profundidad.
+
+### 3. DOM Libre de Layout Reflow (ResizeObserver)
+* **Cero Layout Thrashing**: La gestión del tamaño del canvas se realiza mediante un protector asíncrono basado en un `ResizeObserver` nativo.
+* **Bucle de Renderizado Estable**: Evita el acceso a propiedades bloqueantes como `window.innerWidth`/`innerHeight` dentro del bucle de requestAnimationFrame, manteniendo 60 FPS sólidos y fluidos.
+
+### 4. Diagnóstico de Compilación en Naga y DevTools
+* **Pruebas de Validación Naga**: Incorpora una suite de tests nativos en Rust que ejecutan el validador `naga` de wgpu bajo `cargo test` para verificar el correcto formateo del WGSL sin requerir un navegador.
+* **Captura de Errores de Navegador**: Añade un interceptor en `index.html` sobre `GPUDevice.prototype.createShaderModule` que evalúa las alertas de compilación y las imprime con un alto nivel de detalle visual (línea, columna y carets `^`) directamente en la consola web de desarrollo.
+
 ---
 
 ## 🛠️ Stack Tecnológico

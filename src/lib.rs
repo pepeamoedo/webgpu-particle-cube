@@ -113,6 +113,7 @@ fn create_multisampled_framebuffer(device: &wgpu::Device, config: &wgpu::Surface
     multisampled_texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub async fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -958,9 +959,45 @@ pub async fn start() -> Result<(), JsValue> {
     Ok(())
 }
 
+#[cfg(target_arch = "wasm32")]
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
     web_sys::window()
         .unwrap()
         .request_animation_frame(f.as_ref().unchecked_ref())
         .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_modular_shader() {
+        let common = include_str!("shaders/common.wgsl");
+        let particles = include_str!("shaders/particles.wgsl");
+        let lines = include_str!("shaders/lines.wgsl");
+        let glass = include_str!("shaders/glass.wgsl");
+        
+        let shader_source = format!("{}{}{}{}", common, particles, lines, glass);
+        
+        let mut frontend = wgpu::naga::front::wgsl::Frontend::new();
+        match frontend.parse(&shader_source) {
+            Ok(module) => {
+                println!("Shader parsed successfully!");
+                let mut validator = wgpu::naga::valid::Validator::new(
+                    wgpu::naga::valid::ValidationFlags::all(),
+                    wgpu::naga::valid::Capabilities::all(),
+                );
+                match validator.validate(&module) {
+                    Ok(_) => println!("Shader validated successfully!"),
+                    Err(e) => {
+                        let error_msg = e.emit_to_string(&shader_source);
+                        panic!("Validation Error:\n{}", error_msg);
+                    }
+                }
+            }
+            Err(e) => {
+                let error_msg = e.emit_to_string(&shader_source);
+                panic!("Parsing Error:\n{}", error_msg);
+            }
+        }
+    }
 }
