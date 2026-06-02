@@ -4,66 +4,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 // =====================================================================
-// ÁLGEBRA 3D MINIMALISTA (DIRECTO AL METAL)
+// ÁLGEBRA SIMD CON GLAM (MIGRADO A PRODUCCIÓN)
 // =====================================================================
-
-fn perspective(aspect: f32, fovy: f32, znear: f32, zfar: f32) -> [f32; 16] {
-    let f = 1.0 / (fovy / 2.0).tan();
-    let r_depth = 1.0 / (znear - zfar);
-    [
-        f / aspect, 0.0, 0.0, 0.0,
-        0.0, f, 0.0, 0.0,
-        0.0, 0.0, zfar * r_depth, -1.0,
-        0.0, 0.0, znear * zfar * r_depth, 0.0,
-    ]
-}
-
-fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [f32; 16] {
-    let f = {
-        let mut v = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
-        let len = (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt();
-        v[0] /= len; v[1] /= len; v[2] /= len;
-        v
-    };
-    let s = {
-        let mut v = [
-            f[1] * up[2] - f[2] * up[1],
-            f[2] * up[0] - f[0] * up[2],
-            f[0] * up[1] - f[1] * up[0],
-        ];
-        let len = (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt();
-        v[0] /= len; v[1] /= len; v[2] /= len;
-        v
-    };
-    let u = [
-        s[1] * f[2] - s[2] * f[1],
-        s[2] * f[0] - s[0] * f[2],
-        s[0] * f[1] - s[1] * f[0],
-    ];
-    [
-        s[0], u[0], -f[0], 0.0,
-        s[1], u[1], -f[1], 0.0,
-        s[2], u[2], -f[2], 0.0,
-        -(s[0]*eye[0] + s[1]*eye[1] + s[2]*eye[2]),
-        -(u[0]*eye[0] + u[1]*eye[1] + u[2]*eye[2]),
-        (f[0]*eye[0] + f[1]*eye[1] + f[2]*eye[2]),
-        1.0,
-    ]
-}
-
-fn mat4_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
-    let mut out = [0.0; 16];
-    for col in 0..4 {
-        for row in 0..4 {
-            out[col * 4 + row] = 
-                a[0 * 4 + row] * b[col * 4 + 0] +
-                a[1 * 4 + row] * b[col * 4 + 1] +
-                a[2 * 4 + row] * b[col * 4 + 2] +
-                a[3 * 4 + row] * b[col * 4 + 3];
-        }
-    }
-    out
-}
 
 // =====================================================================
 // ESTRUCTURAS DE DATOS DE UNIFORMS (REPR C)
@@ -105,6 +47,24 @@ struct CameraState {
     last_mouse_y: f32,
 }
 
+fn create_depth_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Depth Texture"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth24Plus,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    depth_texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 #[wasm_bindgen(start)]
 pub async fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -120,10 +80,19 @@ pub async fn start() -> Result<(), JsValue> {
         .ok_or("No se encontró el canvas con id='canvas'")?
         .dyn_into::<web_sys::HtmlCanvasElement>()?;
 
-    let mut width = window.inner_width()?.as_f64().ok_or("Ancho de ventana inválido")? as u32;
-    let mut height = window.inner_height()?.as_f64().ok_or("Alto de ventana inválido")? as u32;
-    canvas.set_width(width);
-    canvas.set_height(height);
+    let dpr = window.device_pixel_ratio();
+    let mut logical_width = window.inner_width()?.as_f64().ok_or("Ancho de ventana inválido")?;
+    let mut logical_height = window.inner_height()?.as_f64().ok_or("Alto de ventana inválido")?;
+
+    let mut physical_width = (logical_width * dpr) as u32;
+    let mut physical_height = (logical_height * dpr) as u32;
+
+    canvas.set_width(physical_width);
+    canvas.set_height(physical_height);
+
+    let canvas_style = canvas.style();
+    canvas_style.set_property("width", &format!("{}px", logical_width))?;
+    canvas_style.set_property("height", &format!("{}px", logical_height))?;
 
     let size_slider = document
         .get_element_by_id("size-slider")
@@ -179,14 +148,15 @@ pub async fn start() -> Result<(), JsValue> {
     let mut config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format: surface_format,
-        width,
-        height,
+        width: physical_width,
+        height: physical_height,
         present_mode: wgpu::PresentMode::Fifo,
         alpha_mode: surface_caps.alpha_modes[0],
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
     };
     surface.configure(&device, &config);
+    let mut depth_texture_view = create_depth_texture(&device, &config);
 
     // Bindeo de Eventos Interactivos de la Cámara (Ángulos esféricos)
     let camera_state = Rc::new(RefCell::new(CameraState {
@@ -383,7 +353,13 @@ pub async fn start() -> Result<(), JsValue> {
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24Plus,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
     });
@@ -425,7 +401,13 @@ pub async fn start() -> Result<(), JsValue> {
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24Plus,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
     });
@@ -467,7 +449,13 @@ pub async fn start() -> Result<(), JsValue> {
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24Plus,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
     });
@@ -497,23 +485,39 @@ pub async fn start() -> Result<(), JsValue> {
     let line_pipeline_clone = line_pipeline.clone();
     let glass_pipeline_clone = glass_pipeline.clone();
 
+    let mut last_size_val = -1.0f32;
+    let mut last_spacing_val = -1.0f32;
+    let mut last_light_val = -1.0f32;
+
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-        // A. Resize dinámico
-        let current_width = window_clone.inner_width().unwrap().as_f64().unwrap() as u32;
-        let current_height = window_clone.inner_height().unwrap().as_f64().unwrap() as u32;
+        // A. Resize dinámico con DPR (Pantallas Retina)
+        let current_logical_width = window_clone.inner_width().unwrap().as_f64().unwrap();
+        let current_logical_height = window_clone.inner_height().unwrap().as_f64().unwrap();
         
-        if current_width != width || current_height != height {
-            width = current_width;
-            height = current_height;
-            canvas_clone.set_width(width);
-            canvas_clone.set_height(height);
+        if current_logical_width != logical_width || current_logical_height != logical_height {
+            logical_width = current_logical_width;
+            logical_height = current_logical_height;
             
-            config.width = width;
-            config.height = height;
+            let dpr = window_clone.device_pixel_ratio();
+            physical_width = (logical_width * dpr) as u32;
+            physical_height = (logical_height * dpr) as u32;
+            
+            canvas_clone.set_width(physical_width);
+            canvas_clone.set_height(physical_height);
+            
+            let canvas_style = canvas_clone.style();
+            canvas_style.set_property("width", &format!("{}px", logical_width)).unwrap();
+            canvas_style.set_property("height", &format!("{}px", logical_height)).unwrap();
+            
+            config.width = physical_width;
+            config.height = physical_height;
             surface.configure(&device, &config);
+            
+            // Recrear la textura de profundidad al redimensionar físicamente
+            depth_texture_view = create_depth_texture(&device, &config);
         }
 
-        // A2. ACTUALIZAR PARÁMETROS DEL PANEL DE CONTROL EN TIEMPO REAL
+        // A2. ACTUALIZAR PARÁMETROS DEL PANEL DE CONTROL EN TIEMPO REAL (Dirty Flags)
         let size_val = size_slider_clone
             .as_ref()
             .map(|s| s.value().parse::<f32>().unwrap_or(0.005))
@@ -527,16 +531,22 @@ pub async fn start() -> Result<(), JsValue> {
             .map(|s| s.value().parse::<f32>().unwrap_or(0.8))
             .unwrap_or(0.8);
 
-        let lighting_data = LightingConfig {
-            ambient_color: [0.15 * light_val, 0.1 * light_val, 0.25 * light_val, light_val],
-            light_dir: [1.0, 1.5, 1.0, 0.0],
-            params: [size_val, spacing_val, light_val, 0.0],
-        };
-        unsafe {
-            queue.write_buffer(&lighting_buffer_clone, 0, any_as_u8_slice(&lighting_data));
+        if size_val != last_size_val || spacing_val != last_spacing_val || light_val != last_light_val {
+            last_size_val = size_val;
+            last_spacing_val = spacing_val;
+            last_light_val = light_val;
+
+            let lighting_data = LightingConfig {
+                ambient_color: [0.15 * light_val, 0.1 * light_val, 0.25 * light_val, light_val],
+                light_dir: [1.0, 1.5, 1.0, 0.0],
+                params: [size_val, spacing_val, light_val, 0.0],
+            };
+            unsafe {
+                queue.write_buffer(&lighting_buffer_clone, 0, any_as_u8_slice(&lighting_data));
+            }
         }
 
-        // B. CALCULAR PROCESO DE CÁMARA E INTERACCIÓN
+        // B. CALCULAR PROCESO DE CÁMARA E INTERACCIÓN (SIMD Glam Math)
         let (eye, view_proj) = {
             let state = camera_state.borrow();
             
@@ -546,11 +556,17 @@ pub async fn start() -> Result<(), JsValue> {
             let eye_z = state.radius * state.phi.sin() * state.theta.sin();
             let eye_pos = [eye_x, eye_y, eye_z];
 
-            let view = look_at(eye_pos, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
-            let aspect = width as f32 / height as f32;
-            let proj = perspective(aspect, 45.0f32.to_radians(), 0.1, 100.0);
+            let eye_vec = glam::Vec3::new(eye_x, eye_y, eye_z);
+            let target_vec = glam::Vec3::ZERO;
+            let up_vec = glam::Vec3::Y;
             
-            (eye_pos, mat4_mul(&proj, &view))
+            let view = glam::Mat4::look_at_rh(eye_vec, target_vec, up_vec);
+            let aspect = physical_width as f32 / physical_height as f32;
+            let proj = glam::Mat4::perspective_rh_gl(45.0f32.to_radians(), aspect, 0.1, 100.0);
+            
+            let vp = proj * view;
+            
+            (eye_pos, vp.to_cols_array())
         };
 
         // C. SUBIR DATOS DE CÁMARA A LA GPU
@@ -593,7 +609,15 @@ pub async fn start() -> Result<(), JsValue> {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                // Activar el Attachment del Z-Buffer (Búfer de profundidad física)
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_texture_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
