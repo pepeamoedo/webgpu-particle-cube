@@ -34,8 +34,32 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
     )
 }
 
+// Utilidad unsafe para convertir vectores completos a slice de bytes
+unsafe fn slice_as_u8_slice<T: Sized>(p: &[T]) -> &[u8] {
+    std::slice::from_raw_parts(
+        p.as_ptr() as *const u8,
+        p.len() * std::mem::size_of::<T>(),
+    )
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct ParticleStruct {
+    pos: [f32; 4],
+    vel: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct ComputeParams {
+    spacing: f32,
+    delta_time: f32,
+    intensity: f32,
+    dummy: f32,
+}
+
 // =====================================================================
-// ESTADO DE CÁMARA ORBITAL
+// ESTADO DE CÁMARA ORBITAL Y VIEWPORT
 // =====================================================================
 
 struct CameraState {
@@ -47,6 +71,12 @@ struct CameraState {
     last_mouse_y: f32,
 }
 
+struct ViewportState {
+    logical_width: f64,
+    logical_height: f64,
+    dirty: bool,
+}
+
 fn create_depth_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
     let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Depth Texture"),
@@ -56,13 +86,31 @@ fn create_depth_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfigurati
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count: 4, // MSAA 4x - Debe coincidir con el sample count del framebuffer de color!
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth24Plus,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     depth_texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn create_multisampled_framebuffer(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    let multisampled_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("MSAA Framebuffer"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 4, // MSAA 4x
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    multisampled_texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 #[wasm_bindgen(start)]
@@ -81,8 +129,8 @@ pub async fn start() -> Result<(), JsValue> {
         .dyn_into::<web_sys::HtmlCanvasElement>()?;
 
     let dpr = window.device_pixel_ratio();
-    let mut logical_width = window.inner_width()?.as_f64().ok_or("Ancho de ventana inválido")?;
-    let mut logical_height = window.inner_height()?.as_f64().ok_or("Alto de ventana inválido")?;
+    let logical_width = window.inner_width()?.as_f64().ok_or("Ancho de ventana inválido")?;
+    let logical_height = window.inner_height()?.as_f64().ok_or("Alto de ventana inválido")?;
 
     let mut physical_width = (logical_width * dpr) as u32;
     let mut physical_height = (logical_height * dpr) as u32;
@@ -156,7 +204,6 @@ pub async fn start() -> Result<(), JsValue> {
         desired_maximum_frame_latency: 2,
     };
     surface.configure(&device, &config);
-    let mut depth_texture_view = create_depth_texture(&device, &config);
 
     // Bindeo de Eventos Interactivos de la Cámara (Ángulos esféricos)
     let camera_state = Rc::new(RefCell::new(CameraState {
@@ -222,6 +269,62 @@ pub async fn start() -> Result<(), JsValue> {
     }
 
     // =====================================================================
+    // INICIALIZACIÓN DE DATOS DEL STORAGE BUFFER (1,728 PARTÍCULAS)
+    // =====================================================================
+    let num_particles = 1728;
+    let mut initial_particles = Vec::with_capacity(num_particles);
+    let spacing_init = 1.0f32;
+    
+    for iz in 0..12 {
+        for iy in 0..12 {
+            for ix in 0..12 {
+                // Generar coordenadas del cubo de cristal de -1.0 a 1.0 (centrado en el origen)
+                let px = (ix as f32 - 5.5) * (spacing_init / 5.5);
+                let py = (iy as f32 - 5.5) * (spacing_init / 5.5);
+                let pz = (iz as f32 - 5.5) * (spacing_init / 5.5);
+                
+                // Velocidades orbitales iniciales en el eje Y (tangente)
+                let vx = -pz * 0.1;
+                let vy = 0.0f32;
+                let vz = px * 0.1;
+                
+                initial_particles.push(ParticleStruct {
+                    pos: [px, py, pz, 1.0],
+                    vel: [vx, vy, vz, 0.0],
+                });
+            }
+        }
+    }
+
+    // Crear Storage Buffer para las posiciones dinámicas de las partículas
+    let storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Particle Storage Buffer"),
+        size: (initial_particles.len() * std::mem::size_of::<ParticleStruct>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    unsafe {
+        queue.write_buffer(&storage_buffer, 0, slice_as_u8_slice(&initial_particles));
+    }
+
+    // Crear Uniform Buffer para parámetros de Cómputo
+    let compute_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Compute Params Buffer"),
+        size: std::mem::size_of::<ComputeParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let initial_compute_params = ComputeParams {
+        spacing: 1.0,
+        delta_time: 0.016,
+        intensity: 0.8,
+        dummy: 0.0,
+    };
+    unsafe {
+        queue.write_buffer(&compute_params_buffer, 0, any_as_u8_slice(&initial_compute_params));
+    }
+
+    // =====================================================================
     // PREPARACIÓN DE BUFFERS DE UNIFORMS (PROCESOS DE CÁMARA Y LUZ)
     // =====================================================================
 
@@ -241,7 +344,7 @@ pub async fn start() -> Result<(), JsValue> {
         mapped_at_creation: false,
     });
 
-    // Escribir datos iniciales de luz (Ambiental violeta profundo + Luz direccional blanca inclinada)
+    // Escribir datos iniciales de luz
     let initial_lighting = LightingConfig {
         ambient_color: [0.15, 0.1, 0.25, 0.8], // Violeta neón ambiental
         light_dir: [1.0, 1.5, 1.0, 0.0],       // Luz desde el cuadrante superior derecho
@@ -252,7 +355,7 @@ pub async fn start() -> Result<(), JsValue> {
     }
 
     // =====================================================================
-    // CREACIÓN DEL BIND GROUP LAYOUT Y BIND GROUP
+    // CREACIÓN DEL BIND GROUP LAYOUT Y BIND GROUP (UNIFORMS)
     // =====================================================================
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("Uniforms Bind Group Layout"),
@@ -295,7 +398,81 @@ pub async fn start() -> Result<(), JsValue> {
         ],
     });
 
-    // Cargar Shaders WGSL (Compilados/Concatenados en tiempo de compilación para cero sobrecarga de ejecución)
+    // =====================================================================
+    // CREACIÓN DEL BIND GROUP LAYOUT Y BIND GROUP (STORAGE RENDER)
+    // =====================================================================
+    let bind_group_layout_1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Storage Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let bind_group_1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Storage Bind Group"),
+        layout: &bind_group_layout_1,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: storage_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    // =====================================================================
+    // CREACIÓN DEL BIND GROUP LAYOUT Y BIND GROUP (COMPUTE)
+    // =====================================================================
+    let compute_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Compute Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Compute Bind Group"),
+        layout: &compute_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: storage_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: compute_params_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    // Cargar Shaders WGSL (Modular shader para rendering)
     let shader_source = concat!(
         include_str!("shaders/common.wgsl"),
         include_str!("shaders/particles.wgsl"),
@@ -308,11 +485,34 @@ pub async fn start() -> Result<(), JsValue> {
         source: wgpu::ShaderSource::Wgsl(shader_source.into()),
     });
 
-    // Crear Pipeline Layout con nuestro Bind Group Layout
+    // Cargar Compute Shader WGSL
+    let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Compute Shader Module"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/compute.wgsl").into()),
+    });
+
+    // Crear Pipeline Layout con ambos Bind Group Layouts (Uniforms en slot 0, Storage en slot 1)
     let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Render Pipeline Layout"),
-        bind_group_layouts: &[&bind_group_layout],
+        bind_group_layouts: &[&bind_group_layout, &bind_group_layout_1],
         push_constant_ranges: &[],
+    });
+
+    // Crear Compute Pipeline Layout
+    let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Compute Pipeline Layout"),
+        bind_group_layouts: &[&compute_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    // =====================================================================
+    // COMPILACIÓN DE PIPELINES (SINCRÓNICOS PARA COMPATIBILIDAD CON WGPU 0.19)
+    // =====================================================================
+    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Compute Pipeline"),
+        layout: Some(&compute_pipeline_layout),
+        module: &compute_shader,
+        entry_point: "main",
     });
 
     let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -321,18 +521,17 @@ pub async fn start() -> Result<(), JsValue> {
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: "vs_main",
-            buffers: &[], // Expansión de geometría interna en el Shader
+            buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: "fs_main",
             targets: &[Some(wgpu::ColorTargetState {
                 format: config.format,
-                // Activamos mezcla de colores (Alpha Blending) para dar un efecto de brillo neón acumulado
                 blend: Some(wgpu::BlendState {
                     color: wgpu::BlendComponent {
                         src_factor: wgpu::BlendFactor::SrcAlpha,
-                        dst_factor: wgpu::BlendFactor::One, // Aditivo para el brillo
+                        dst_factor: wgpu::BlendFactor::One,
                         operation: wgpu::BlendOperation::Add,
                     },
                     alpha: wgpu::BlendComponent {
@@ -360,7 +559,11 @@ pub async fn start() -> Result<(), JsValue> {
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: 4, // MSAA 4x
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         multiview: None,
     });
 
@@ -408,7 +611,11 @@ pub async fn start() -> Result<(), JsValue> {
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: 4, // MSAA 4x
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         multiview: None,
     });
 
@@ -444,7 +651,7 @@ pub async fn start() -> Result<(), JsValue> {
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None, // Sin culling para ver tanto el cristal frontal como el trasero
+            cull_mode: None,
             polygon_mode: wgpu::PolygonMode::Fill,
             unclipped_depth: false,
             conservative: false,
@@ -456,11 +663,53 @@ pub async fn start() -> Result<(), JsValue> {
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: 4, // MSAA 4x
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         multiview: None,
     });
 
-    log::info!("Pipeline y Uniforms inicializados. Lanzando bucle interactivo.");
+    log::info!("Pipelines, Storage y Uniforms inicializados. Lanzando bucle interactivo.");
+
+    // =====================================================================
+    // NATIVE RESIZEOBSERVER PARA ELIMINAR EL LAYOUT THRASHING
+    // =====================================================================
+    let viewport_state = Rc::new(RefCell::new(ViewportState {
+        logical_width,
+        logical_height,
+        dirty: true, // Forzar creación inicial de texturas MSAA y profundidad
+    }));
+
+    let observer = {
+        let state = viewport_state.clone();
+        let on_resize = Closure::wrap(Box::new(move |entries: js_sys::Array| {
+            if entries.length() > 0 {
+                if let Ok(entry) = entries.get(0).dyn_into::<web_sys::ResizeObserverEntry>() {
+                    let rect = entry.content_rect();
+                    let mut s = state.borrow_mut();
+                    s.logical_width = rect.width();
+                    s.logical_height = rect.height();
+                    s.dirty = true;
+                }
+            }
+        }) as Box<dyn FnMut(js_sys::Array)>);
+
+        let obs = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref())
+            .expect("No se pudo crear el ResizeObserver");
+        obs.observe(&canvas);
+        on_resize.forget();
+        obs
+    };
+
+    // Inicializar buffers multisampled framebuffer y depth texture
+    let mut msaa_texture_view = create_multisampled_framebuffer(&device, &config);
+    let mut depth_texture_view = create_depth_texture(&device, &config);
+
+    // Reloj de alta precisión para medir delta_time estable
+    let performance = window.performance().ok_or("No existe performance object")?;
+    let mut last_frame_time = performance.now();
 
     // Bucle de Renderizado
     let f = Rc::new(RefCell::new(None));
@@ -472,9 +721,15 @@ pub async fn start() -> Result<(), JsValue> {
     let render_pipeline = Rc::new(render_pipeline);
     let line_pipeline = Rc::new(line_pipeline);
     let glass_pipeline = Rc::new(glass_pipeline);
+    let compute_pipeline = Rc::new(compute_pipeline);
     let bind_group = Rc::new(bind_group);
+    let bind_group_1 = Rc::new(bind_group_1);
+    let compute_bind_group = Rc::new(compute_bind_group);
     let camera_buffer = Rc::new(camera_buffer);
     let lighting_buffer = Rc::new(lighting_buffer);
+    let compute_params_buffer = Rc::new(compute_params_buffer);
+    let viewport_state_clone = viewport_state.clone();
+    let performance_clone = performance.clone();
 
     let canvas_clone = canvas.clone();
     let window_clone = window.clone();
@@ -484,40 +739,46 @@ pub async fn start() -> Result<(), JsValue> {
     let lighting_buffer_clone = lighting_buffer.clone();
     let line_pipeline_clone = line_pipeline.clone();
     let glass_pipeline_clone = glass_pipeline.clone();
+    let _observer_keep_alive = observer; // Mantener vivo el ResizeObserver moviéndolo al contexto
 
     let mut last_size_val = -1.0f32;
     let mut last_spacing_val = -1.0f32;
     let mut last_light_val = -1.0f32;
 
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-        // A. Resize dinámico con DPR (Pantallas Retina)
-        let current_logical_width = window_clone.inner_width().unwrap().as_f64().unwrap();
-        let current_logical_height = window_clone.inner_height().unwrap().as_f64().unwrap();
-        
-        if current_logical_width != logical_width || current_logical_height != logical_height {
-            logical_width = current_logical_width;
-            logical_height = current_logical_height;
-            
+        // A. Resize dinámico libre de Layout Thrashing (ResizeObserver)
+        let mut resized = false;
+        let (w, h) = {
+            let mut state = viewport_state_clone.borrow_mut();
+            if state.dirty {
+                state.dirty = false;
+                resized = true;
+            }
+            (state.logical_width, state.logical_height)
+        };
+
+        if resized {
             let dpr = window_clone.device_pixel_ratio();
-            physical_width = (logical_width * dpr) as u32;
-            physical_height = (logical_height * dpr) as u32;
+            physical_width = (w * dpr) as u32;
+            physical_height = (h * dpr) as u32;
             
             canvas_clone.set_width(physical_width);
             canvas_clone.set_height(physical_height);
             
             let canvas_style = canvas_clone.style();
-            canvas_style.set_property("width", &format!("{}px", logical_width)).unwrap();
-            canvas_style.set_property("height", &format!("{}px", logical_height)).unwrap();
+            canvas_style.set_property("width", &format!("{}px", w)).unwrap();
+            canvas_style.set_property("height", &format!("{}px", h)).unwrap();
             
             config.width = physical_width;
             config.height = physical_height;
             surface.configure(&device, &config);
             
-            // Recrear la textura de profundidad al redimensionar físicamente
+            // Recrear texturas MSAA y profundidad para coincidir con la resolución física exacta
+            msaa_texture_view = create_multisampled_framebuffer(&device, &config);
             depth_texture_view = create_depth_texture(&device, &config);
         }
 
-        // A2. ACTUALIZAR PARÁMETROS DEL PANEL DE CONTROL EN TIEMPO REAL (Dirty Flags)
+        // A2. ACTUALIZAR PARÁMETROS DEL PANEL DE CONTROL EN TIEMPO REAL
         let size_val = size_slider_clone
             .as_ref()
             .map(|s| s.value().parse::<f32>().unwrap_or(0.005))
@@ -544,6 +805,25 @@ pub async fn start() -> Result<(), JsValue> {
             unsafe {
                 queue.write_buffer(&lighting_buffer_clone, 0, any_as_u8_slice(&lighting_data));
             }
+        }
+
+        // Medir delta_time preciso
+        let now = performance_clone.now();
+        let mut dt = ((now - last_frame_time) / 1000.0) as f32;
+        last_frame_time = now;
+        if dt > 0.1 {
+            dt = 0.016; // Prevenir saltos de físicas al suspender pestaña
+        }
+
+        // Escribir los parámetros de cómputo (físicas dinámicas en GPU)
+        let compute_params_data = ComputeParams {
+            spacing: spacing_val,
+            delta_time: dt,
+            intensity: light_val,
+            dummy: 0.0,
+        };
+        unsafe {
+            queue.write_buffer(&compute_params_buffer, 0, any_as_u8_slice(&compute_params_data));
         }
 
         // B. CALCULAR PROCESO DE CÁMARA E INTERACCIÓN (SIMD Glam Math)
@@ -592,14 +872,29 @@ pub async fn start() -> Result<(), JsValue> {
             label: Some("Frame Encoder"),
         });
 
+        // =====================================================================
+        // COMPUTE PASS: SIMULACIÓN DE FÍSICAS PARALELAS EN GPU
+        // =====================================================================
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Physics Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&compute_pipeline);
+            compute_pass.set_bind_group(0, &compute_bind_group, &[]);
+            compute_pass.dispatch_workgroups(7, 1, 1); // 1,728 partículas / 256 workgroup_size = 6.75 -> 7 grupos
+        }
+
+        // =====================================================================
+        // RENDER PASS: DIBUJADO DE ESCENA CON MSAA 4x E ILUMINACIÓN
+        // =====================================================================
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Interactive Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: &msaa_texture_view,
+                    resolve_target: Some(&view),
                     ops: wgpu::Operations {
-                        // Fondo modo oscuro elegante
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.015,
                             g: 0.012,
@@ -609,7 +904,6 @@ pub async fn start() -> Result<(), JsValue> {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                // Activar el Attachment del Z-Buffer (Búfer de profundidad física)
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth_texture_view,
                     depth_ops: Some(wgpu::Operations {
@@ -625,14 +919,19 @@ pub async fn start() -> Result<(), JsValue> {
             // 1. Dibujamos el lattice de líneas conectadas en 3D (9504 vértices)
             render_pass.set_pipeline(&line_pipeline_clone);
             render_pass.set_bind_group(0, &bind_group, &[]);
+            render_pass.set_bind_group(1, &bind_group_1, &[]);
             render_pass.draw(0..9504, 0..1);
 
             // 2. Dibujamos los puntos nítidos de las partículas (10368 vértices)
             render_pass.set_pipeline(&render_pipeline);
+            render_pass.set_bind_group(0, &bind_group, &[]);
+            render_pass.set_bind_group(1, &bind_group_1, &[]);
             render_pass.draw(0..10368, 0..1);
 
             // 3. Dibujamos el cristal encasillador exterior (36 vértices procedimentales)
             render_pass.set_pipeline(&glass_pipeline_clone);
+            render_pass.set_bind_group(0, &bind_group, &[]);
+            render_pass.set_bind_group(1, &bind_group_1, &[]);
             render_pass.draw(0..36, 0..1);
         }
 

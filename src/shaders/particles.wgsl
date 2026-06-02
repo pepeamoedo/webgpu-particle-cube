@@ -1,6 +1,14 @@
 // =====================================================================
 // PROCESO: Renderizado de Partículas (Billboarding)
 // =====================================================================
+struct Particle {
+    pos: vec4<f32>,
+    vel: vec4<f32>,
+};
+
+@group(1) @binding(0)
+var<storage, read> particles: array<Particle>;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
@@ -17,9 +25,10 @@ fn vs_main(
     let particle_index = in_vertex_index / 6u;
     let quad_vertex_index = in_vertex_index % 6u;
     
-    let p = generate_particle_grid(particle_index);
+    let p = particles[particle_index];
+    let pos = p.pos.xyz;
     
-    // Determinar UV y offset local para hacer el quad alineado a la pantalla (Billboard)
+    // Determinar UV y offset local para hacer el quad alinedo a la pantalla (Billboard)
     var uv = vec2<f32>(0.0, 0.0);
     var offset = vec2<f32>(0.0, 0.0);
     
@@ -47,7 +56,7 @@ fn vs_main(
         offset = vec2<f32>(p_size, p_size);
     }
     
-    let world_pos = vec4<f32>(p.position, 1.0);
+    let world_pos = vec4<f32>(pos, 1.0);
     var clip_pos = camera.view_proj * world_pos;
     
     // Aplicar el tamaño del billboard de forma independiente en espacio de proyección
@@ -55,7 +64,14 @@ fn vs_main(
     clip_pos.y += offset.y * clip_pos.w;
     
     out.clip_position = clip_pos;
-    out.color = p.color;
+    
+    // Mapeo dinámico y fluido de degradado cromático en caliente según la posición física real
+    let spacing = lighting.params.y;
+    let r = (pos.x / (spacing * 2.0) + 0.5);
+    let g = (pos.y / (spacing * 2.0) + 0.5);
+    let b = (pos.z / (spacing * 2.0) + 0.5);
+    out.color = vec3<f32>(r * 0.9 + 0.1, g * 0.9 + 0.1, b * 0.9 + 0.1);
+    
     out.uv = uv;
     
     return out;
