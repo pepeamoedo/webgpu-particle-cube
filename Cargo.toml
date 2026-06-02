@@ -1,0 +1,36 @@
+[package]
+name = "webgpu_wasm_triangle"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = "0.2.92"
+wasm-bindgen-futures = "0.4.42"
+wgpu = { version = "0.19.3", features = ["webgl"] }
+console_error_panic_hook = "0.1.7"
+log = "0.4.21"
+console_log = "1.0.0"
+
+[dependencies.web-sys]
+version = "0.3.69"
+features = [
+  "Document",
+  "Window",
+  "Element",
+  "HtmlCanvasElement",
+  "Gpu",
+  "GpuAdapter",
+  "GpuDevice",
+  "GpuQueue",
+  "GpuCanvasContext",
+  "GpuTextureFormat",
+  "MouseEvent",
+  "WheelEvent",
+  "HtmlInputElement",
+]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

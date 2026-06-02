@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Native WASM Engine</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #040406;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+        #ui-overlay {
+            position: absolute;
+            top: 24px;
+            left: 24px;
+            color: rgba(255, 255, 255, 0.85);
+            background: rgba(12, 12, 18, 0.7);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 14px;
+            padding: 20px 24px;
+            pointer-events: auto; /* Cambiado a auto para permitir clics e interactividad */
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.6);
+            width: 280px;
+            z-index: 10;
+        }
+        h1 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+            color: #ffffff;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+        p {
+            font-size: 0.8rem;
+            color: rgba(255, 255, 255, 0.45);
+            line-height: 1.4;
+            margin-bottom: 12px;
+        }
+        .control-group {
+            margin-top: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .control-group label {
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: rgba(255, 255, 255, 0.5);
+        }
+        .control-group input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 4px;
+            border-radius: 2px;
+            background: rgba(255, 255, 255, 0.12);
+            outline: none;
+        }
+        .control-group input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: #00e5ff;
+            cursor: pointer;
+            box-shadow: 0 0 6px #00e5ff;
+            transition: transform 0.1s;
+        }
+        .control-group input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.25);
+        }
+        .tech-badge {
+            display: inline-block;
+            margin-top: 18px;
+            padding: 3px 8px;
+            background: rgba(255, 255, 255, 0.06);
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.72rem;
+            color: #00e5ff;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-overlay">
+        <h1>WebGPU Engine</h1>
+        <p>Volumetric 3D Particle Cube</p>
+        
+        <div class="control-group">
+            <label for="size-slider">Tamaño Partículas</label>
+            <input type="range" id="size-slider" min="0.002" max="0.015" step="0.0005" value="0.005">
+        </div>
+        
+        <div class="control-group">
+            <label for="spacing-slider">Espaciado del Cubo</label>
+            <input type="range" id="spacing-slider" min="0.3" max="2.0" step="0.05" value="1.0">
+        </div>
+        
+        <div class="control-group">
+            <label for="light-slider">Intensidad Brillo</label>
+            <input type="range" id="light-slider" min="0.1" max="2.0" step="0.05" value="0.8">
+        </div>
+        
+        <span class="tech-badge">Direct-to-metal rendering</span>
+    </div>
+    
+    <canvas id="canvas"></canvas>
+
+    <script type="module">
+        import init from "./pkg/webgpu_wasm_triangle.js";
+        
+        async function run() {
+            try {
+                await init();
+                console.log("Módulo WASM inicializado con éxito.");
+            } catch (err) {
+                console.error("Error al inicializar el módulo WASM:", err);
+            }
+        }
+        
+        run();
+    </script>
+</body>
+</html>
