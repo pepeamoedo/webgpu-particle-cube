@@ -844,8 +844,12 @@ pub async fn start() -> Result<(), JsValue> {
             let up_vec = glam::Vec3::Y;
             
             let view = glam::Mat4::look_at_rh(eye_vec, target_vec, up_vec);
-            let aspect = physical_width as f32 / physical_height as f32;
-            let proj = glam::Mat4::perspective_rh_gl(45.0f32.to_radians(), aspect, 0.1, 100.0);
+            let aspect = if physical_height > 0 {
+                physical_width as f32 / physical_height as f32
+            } else {
+                1.0
+            };
+            let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect, 0.1, 100.0);
             
             let vp = proj * view;
             
