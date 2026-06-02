@@ -71,16 +71,16 @@ fn bilateral(uv: vec2<f32>, center_d: f32, step: vec2<f32>) -> f32 {
 fn fs_bilateral_h(in: PostOut) -> @location(0) vec4<f32> {
     let d = textureSample(t_ssfr, s_ssfr, in.uv).r;
     if (d < 0.001) { return vec4<f32>(0.0); }
-    let smooth = bilateral(in.uv, d, vec2<f32>(pp.texel_size.x, 0.0));
-    return vec4<f32>(smooth, 0.0, 0.0, 1.0);
+    let smoothed_d = bilateral(in.uv, d, vec2<f32>(pp.texel_size.x, 0.0));
+    return vec4<f32>(smoothed_d, 0.0, 0.0, 1.0);
 }
 
 @fragment
 fn fs_bilateral_v(in: PostOut) -> @location(0) vec4<f32> {
     let d = textureSample(t_ssfr, s_ssfr, in.uv).r;
     if (d < 0.001) { return vec4<f32>(0.0); }
-    let smooth = bilateral(in.uv, d, vec2<f32>(0.0, pp.texel_size.y));
-    return vec4<f32>(smooth, 0.0, 0.0, 1.0);
+    let smoothed_d = bilateral(in.uv, d, vec2<f32>(0.0, pp.texel_size.y));
+    return vec4<f32>(smoothed_d, 0.0, 0.0, 1.0);
 }
 
 // ─────────────────────────────────────────────────────────────────────
